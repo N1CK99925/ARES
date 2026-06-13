@@ -4,4 +4,5 @@ fastapi
 psycopg2-binary
 alembic
 pytest
+pydantic-settings
 
