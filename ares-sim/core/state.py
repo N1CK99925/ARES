@@ -3,7 +3,6 @@ from pydantic import BaseModel, Field , ConfigDict
 class Side(str, Enum):
     RED = "red"
     BLUE = "blue"
-    model_config = ConfigDict(frozen=True)
         
 
 class ZoneControl(str, Enum):
@@ -11,7 +10,6 @@ class ZoneControl(str, Enum):
     BLUE = "blue"
     NEUTRAL = "neutral"
     CONTESTED = "contested"
-    model_config = ConfigDict(frozen=True)
 
 class ZoneSnapshot(BaseModel):
     """

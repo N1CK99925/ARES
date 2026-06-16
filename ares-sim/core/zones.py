@@ -34,3 +34,14 @@ def determine_zone_control(
 
     # Blue has clear superiority
     return ZoneControl.BLUE
+
+def update_zone_3_ticks(current_control: ZoneControl , previous_control: ZoneControl
+                        ,consecutive_ticks: int) -> int:
+    
+    if current_control in (
+    ZoneControl.NEUTRAL,
+    ZoneControl.CONTESTED):
+        return 0
+    if current_control ==previous_control:
+        return consecutive_ticks + 1
+    return 1
