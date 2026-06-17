@@ -25,7 +25,7 @@ def get_seed_1():
         red_units=50,
         blue_units=0,
         side_control=ZoneControl.RED
-        )
+        ) 
 
     zone_5 = ZoneSnapshot(
         zone_id=5,
