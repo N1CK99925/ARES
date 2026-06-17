@@ -64,13 +64,13 @@ class TickEngine:
 
             pending_deltas = []
             actions_taken_per_side = {Side.BLUE: 0, Side.RED: 0}
+            actions_rejected_per_side = {Side.BLUE: 0, Side.RED: 0}
+            cumulative_outflow = {}  # Track (zone_id, side) -> total units drained this tick
 
             # Process all actions without mutating state
             for action in all_actions:
                 if action.action_type == ActionType.HOLD:
                     continue
-
-                actions_taken_per_side[action.side] += 1
 
                 # Snapshot zone state (read-only)
                 source_zone_snapshot = next(
@@ -82,15 +82,27 @@ class TickEngine:
                     None,
                 )
                 if source_zone_snapshot is None or target_zone_snapshot is None:
+                    actions_rejected_per_side[action.side] += 1
                     continue
 
-                # Verify attacker has sufficient units in source zone
+                # Verify attacker has sufficient units in source zone (including cumulative outflow this tick)
+                source_key = (action.source_zone, action.side)
+                already_drained = cumulative_outflow.get(source_key, 0)
+                
                 if action.side == Side.BLUE:
-                    if source_zone_snapshot.blue_units < action.units_to_move:
+                    available_units = source_zone_snapshot.blue_units - already_drained
+                    if available_units < action.units_to_move:
+                        actions_rejected_per_side[action.side] += 1
                         continue
                 else:  # RED
-                    if source_zone_snapshot.red_units < action.units_to_move:
+                    available_units = source_zone_snapshot.red_units - already_drained
+                    if available_units < action.units_to_move:
+                        actions_rejected_per_side[action.side] += 1
                         continue
+
+                # Action passes validation — increment counter only now
+                actions_taken_per_side[action.side] += 1
+                cumulative_outflow[source_key] = already_drained + action.units_to_move
 
                 # Get attacker and defender units from snapshot
                 attacker_units = action.units_to_move
@@ -177,8 +189,8 @@ class TickEngine:
             # Log tick result
             logger.info(
                 f"Tick {self.state.current_tick}: "
-                f"Blue actions={actions_taken_per_side[Side.BLUE]}, "
-                f"Red actions={actions_taken_per_side[Side.RED]}, "
+                f"Blue actions executed={actions_taken_per_side[Side.BLUE]}, rejected={actions_rejected_per_side[Side.BLUE]}, "
+                f"Red actions executed={actions_taken_per_side[Side.RED]}, rejected={actions_rejected_per_side[Side.RED]}, "
                 f"Deltas applied={len(pending_deltas)}, "
                 f"Zone control: {[(z.zone_id, z.side_control) for z in self.state.zones]}"
             )
@@ -239,7 +251,7 @@ class TickEngine:
                 red_units = max(0, zone.red_units + zone_updates[zone.zone_id][Side.RED])
                 
                 # Recalculate zone control based on updated units
-                new_control = determine_zone_control(blue_units, red_units)
+                new_control = determine_zone_control(red_units, blue_units)
                 
                 updated_zones.append(
                     zone.model_copy(
