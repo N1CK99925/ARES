@@ -1,0 +1,675 @@
+
+================================================================================
+FILE: ./ares-sim/agents/commander.py
+================================================================================
+
+from enum import Enum
+from litellm.exceptions import APIError
+from litellm.types.utils import ModelResponse
+import litellm
+from pydantic import BaseModel
+from core.state import Side,CommanderObs 
+from litellm import completion
+from pathlib import Path
+from typing import cast
+
+CommanderPrompt = Path(
+        "prompts/commander_prompt.md"
+        ).read_text()
+class ActionType(str, Enum):
+    HOLD= "hold"
+    MOVE= "move"
+class CommanderAction(BaseModel):
+   side : Side
+   source_zone:int
+   target_zone:int
+   units_to_move:int
+   action_type : ActionType
+class Actions(BaseModel):
+    actions : list[CommanderAction]
+
+
+litellm.enable_json_schema_validation = True
+# litellm.mock_response
+
+
+
+
+class Commander:
+    def __init__(self, model : str):
+        self.model = model
+
+    def decide(self, obs : CommanderObs)->Actions:
+        messages = [
+                {"role": "system","content": CommanderPrompt},
+                {"role": "user", "content": obs.model_dump_json()}
+                ]
+        try:
+            response : ModelResponse =cast(ModelResponse, completion(
+            model=self.model,
+            messages=messages,
+            response_format=Actions,
+            stream=False
+            )
+                                           )
+        except APIError:
+            try:
+                retry_message = messages + [
+                          {
+            "role": "user",
+            "content": (
+                "Your previous response failed validation. "
+                "Return a valid Actions object and obey the schema."
+            ),
+    }
+                        ]
+                response = cast (ModelResponse, completion(
+                    model=self.model,
+                    messages=retry_message,
+                    response_format=Actions,
+                    stream=False
+                    )
+                )
+            except Exception:
+             # Hold
+              hold_actions = [
+                CommanderAction(
+                    side=obs.side,
+                    source_zone=zone_id,
+                    target_zone=zone_id,
+                    units_to_move=0,
+                    action_type=ActionType.HOLD,
+                    )
+                for zone_id, units in obs.own_unit_per_zone.items()
+                if units > 0
+
+
+                ]
+              return Actions(actions=hold_actions) 
+
+        actions = response.choices[0].message.content
+        if actions is None:
+                raise ValueError("Empty response")
+        return Actions.model_validate_json(actions)
+
+
+================================================================================
+FILE: ./ares-sim/agents/prompt.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/__init__.py
+================================================================================
+
+
+
+
+================================================================================
+FILE: ./ares-sim/config/seeds.py
+================================================================================
+
+
+from core.state import BattleState,ZoneSnapshot,ZoneControl
+
+def get_seed_1():
+    zone_1 = ZoneSnapshot(
+        zone_id=1,
+        red_units=0,
+        blue_units=100,
+        side_control=ZoneControl.BLUE
+        )
+    zone_2 = ZoneSnapshot(
+        zone_id=2,
+        red_units=0,
+        blue_units=50,
+        side_control=ZoneControl.BLUE
+        )
+    zone_3 = ZoneSnapshot(
+        zone_id=3,
+        red_units=0,
+        blue_units=0,
+        side_control=ZoneControl.NEUTRAL
+        )
+    zone_4 = ZoneSnapshot(
+        zone_id=4,
+        red_units=50,
+        blue_units=0,
+        side_control=ZoneControl.RED
+        )
+
+    zone_5 = ZoneSnapshot(
+        zone_id=5,
+        red_units=100,
+        blue_units=0,
+        side_control=ZoneControl.RED
+        )
+    zones = [zone_1, zone_2,zone_3,zone_4,zone_5]
+    # 150 everything because 150 units
+    battle_state = BattleState(
+            current_tick=0,
+            zones = zones,
+            red_fuel=150,
+            blue_fuel=150,
+            red_weapons_remaining=150,
+            blue_weapons_remaining=150,
+            is_engagement_active=True,
+            battle_winner=None,
+            zone_3_consecutive_ticks=0
+            )
+    return battle_state
+
+
+
+
+
+
+def get_seed_2():
+   raise NotImplementedError
+
+
+def get_seed_3():
+    raise NotImplementedError
+
+def get_seed_4():
+    raise NotImplementedError
+
+def get_seed_5():
+    raise NotImplementedError
+
+
+
+================================================================================
+FILE: ./ares-sim/config/settings.py
+================================================================================
+
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    groq_api_key: str
+    model_1: str
+    
+
+
+
+ZONE_CONTEST_RATIO= 0.9
+ZONE_3_WIN_THRESHOLD=0
+
+ADJACENCY = {
+    1: [2],
+    2: [1, 3],
+    3: [2, 4],
+    4: [3, 5],
+    5: [4],
+}
+
+
+
+================================================================================
+FILE: ./ares-sim/config/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/core/attrition.py
+================================================================================
+
+from pydantic import BaseModel, ConfigDict
+import math
+
+
+class AttritionResult(BaseModel):
+    attacker_losses: int
+    defender_losses: int
+    attacker_fuel_penalty: int
+    attacker_weapons_consumed: int
+
+    model_config = ConfigDict(frozen=True)
+
+
+def calculate_attrition(
+    attacker_units: int,
+    defender_units: int,
+    attacker_fuel: int,
+    attacker_controls_flank: bool,
+    attacker_controls_zone_3: bool,
+) -> AttritionResult:
+    # Base losses before any modifiers
+    attacker_losses = defender_units * 0.05
+    defender_losses = attacker_units * 0.06
+
+    fuel_penalty = 0
+
+    # Numerical advantage modifier
+    force_ratio = min(
+    math.sqrt(attacker_units / max(defender_units, 1)),
+    2.0,
+)
+
+    # Larger attacking force inflicts proportionally more losses
+    defender_losses *= force_ratio
+
+    # Zone 3 control provides a positional advantage
+    if attacker_controls_zone_3:
+        defender_losses *= 1.2
+
+    # Lack of flank control reduces combat effectiveness
+    if not attacker_controls_flank:
+        defender_losses *= 0.7
+        fuel_penalty = 10
+
+    # Fuel level impacts sortie effectiveness
+    fuel_effectiveness = max(
+    0.5,
+    min(attacker_fuel / 150, 1.0),
+)
+    defender_losses *= fuel_effectiveness
+
+    # Weapons expenditure scales with engagement activity
+    attacker_weapons_consumed = round(attacker_units * 0.05)
+
+    # Convert to integers and ensure losses never exceed available units
+    attacker_losses = min(round(attacker_losses), attacker_units)
+    defender_losses = min(round(defender_losses), defender_units)
+
+    return AttritionResult(
+        attacker_losses=attacker_losses,
+        defender_losses=defender_losses,
+        attacker_fuel_penalty=fuel_penalty,
+        attacker_weapons_consumed=attacker_weapons_consumed,
+    )
+
+
+================================================================================
+FILE: ./ares-sim/core/obs.py
+================================================================================
+
+from core.state import BattleState, CommanderObs, Side
+
+
+def build_obs(state: BattleState, side: Side) -> CommanderObs:
+    if side == Side.BLUE:
+        own_units = {z.zone_id: z.blue_units for z in state.zones}
+        own_fuel = state.blue_fuel
+        own_weapons = state.blue_weapons_remaining
+        last_enemy_known_zone = None
+        last_enemy_known_units = None
+
+    else:
+        own_units = {z.zone_id: z.red_units for z in state.zones}
+        own_fuel = state.red_fuel
+        own_weapons = state.red_weapons_remaining
+        last_enemy_known_zone = None
+        last_enemy_known_units = None
+
+    # find enemy zones
+    # sort by distance from reference zone (2 for BLUE, 4 for RED)
+    # if found: set last_enemy_known_zone and last_enemy_known_units from closest
+    # if not found: leave as None
+    ref_zone = 2 if side == Side.BLUE else 4
+    enemy_candidates: dict[int, int] = {}
+    for z in state.zones:
+        enemy_count = z.red_units if side == Side.BLUE else z.blue_units
+        if enemy_count > 0:
+            enemy_candidates[z.zone_id] = enemy_count
+
+    if enemy_candidates:
+        closest_zone = min(enemy_candidates.keys(), key=lambda zid: abs(zid - ref_zone))
+        last_enemy_known_zone = closest_zone
+        last_enemy_known_units = enemy_candidates[closest_zone]
+
+    how_many_ticks_ago_enemy_last_seen = None
+
+    return CommanderObs(
+        side=side,
+        current_tick=state.current_tick,
+        own_unit_per_zone=own_units,
+        own_fuel=own_fuel,
+        own_weapons_remaining=own_weapons,
+        enemy_last_known_unit_count=last_enemy_known_units,
+        enemy_last_known_zone=last_enemy_known_zone,
+        how_many_ticks_ago_enemy_last_seen=how_many_ticks_ago_enemy_last_seen,
+    )
+
+
+
+
+    
+
+
+
+
+================================================================================
+FILE: ./ares-sim/core/outcomes.py
+================================================================================
+
+from core.state import BattleState, Side, ZoneControl
+
+from config.settings import ZONE_3_WIN_THRESHOLD
+
+
+
+
+def check_win_condition(state: BattleState) -> BattleState:
+    zone3 = next(
+            zone for zone in state.zones
+            if zone.zone_id == 3             
+            )
+    if ( zone3.side_control in (
+        ZoneControl.RED, ZoneControl.BLUE
+        )
+        and state.zone_3_consecutive_ticks >= ZONE_3_WIN_THRESHOLD):
+
+        winner = (
+                Side.RED
+                if zone3.side_control == ZoneControl.RED
+                else Side.BLUE
+                )
+        return state.model_copy(
+                update={
+                    "is_engagement_active" : False,
+                    "battle_winner" : winner
+            
+            })
+    total_red_units = sum(
+        zone.red_units
+        for zone in state.zones
+    )
+
+    total_blue_units = sum(
+        zone.blue_units
+        for zone in state.zones
+    )
+
+    if total_red_units == 0:
+        return state.model_copy(
+            update={
+                "is_engagement_active": False,
+                "battle_winner": Side.BLUE,
+            }
+        )
+
+    if total_blue_units == 0:
+        return state.model_copy(
+            update={
+                "is_engagement_active": False,
+                "battle_winner": Side.RED,
+            }
+        )
+
+    # No win condition met
+    return state
+
+    
+
+
+================================================================================
+FILE: ./ares-sim/core/state.py
+================================================================================
+
+from enum import Enum
+from pydantic import BaseModel, Field , ConfigDict
+class Side(str, Enum):
+    RED = "red"
+    BLUE = "blue"
+        
+
+class ZoneControl(str, Enum):
+    RED = "red"
+    BLUE = "blue"
+    NEUTRAL = "neutral"
+    CONTESTED = "contested"
+
+class ZoneSnapshot(BaseModel):
+    """
+    Snapshot of a single zone at the current simulation tick.
+    """
+
+    zone_id: int = Field(ge=0)
+
+    red_units: int = Field(
+        ge=0,
+        description="Number of red units currently present in the zone.",
+    )
+
+    blue_units: int = Field(
+        ge=0,
+        description="Number of blue units currently present in the zone.",
+    )
+
+    side_control: ZoneControl = Field(
+        description="Current control state of the zone."
+    )
+    model_config = ConfigDict(frozen=True)
+
+
+class BattleState(BaseModel):
+    """
+    Ground-truth simulation state maintained by the environment.
+
+    Commanders should not directly access this model.
+    Instead, they receive a CommanderOrbs generated from it.
+    """
+
+    current_tick: int = Field(ge=0)
+
+    zones: list[ZoneSnapshot]
+
+    red_fuel: int = Field(ge=0)
+    blue_fuel: int = Field(ge=0)
+
+    red_weapons_remaining: int = Field(ge=0)
+    blue_weapons_remaining: int = Field(ge=0)
+
+    is_engagement_active: bool
+
+    battle_winner: Side | None = Field(
+        default=None,
+        description="Winning side if the battle has concluded.",
+    )
+
+    zone_3_consecutive_ticks:int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Consecutive ticks zone 3 has remained under its current control state. "),
+    )
+    model_config = ConfigDict(frozen=True)
+
+
+class CommanderObs(BaseModel):
+    """
+    Partial observation provided to a commander agent.
+
+    Represents what the commander currently knows about the battlefield,
+    not the full simulation state.
+    """
+
+    side: Side
+
+    current_tick: int = Field(ge=0)
+
+    own_unit_per_zone: dict[int, int] = Field(
+        description="Observed friendly unit count per zone."
+    )
+
+    own_fuel: int = Field(ge=0)
+
+    own_weapons_remaining: int = Field(ge=0)
+
+    enemy_last_known_unit_count: int | None = Field(
+        default=None,
+        ge=0,
+        description="Most recently observed enemy unit count.",
+    )
+
+    enemy_last_known_zone: int | None = Field(
+        default=None,
+        ge=0,
+        description="Zone where the enemy was most recently observed.",
+    )
+
+    how_many_ticks_ago_enemy_last_seen: int | None = Field(
+        default=None,
+        ge=0,
+        description="Ticks elapsed since the last confirmed enemy sighting.",
+    )
+    model_config = ConfigDict(frozen=True)
+
+
+
+
+================================================================================
+FILE: ./ares-sim/core/tick.py
+================================================================================
+
+from core.state import BattleState, Side
+from core.obs import build_obs
+from agents.commander import Commander
+from core.attrition import calculate_attrition
+from core.zones import determine_zone_control, update_zone_3_ticks
+from core.outcomes import check_win_condition
+class TickEngine:
+    def __init__(self, state:BattleState , blue_commander, red_commander):
+        self.state = state
+        self.blue = blue_commander
+        self.red = red_commander
+
+
+
+    def run(self, max_ticks)-> BattleState:
+        while self.state.is_engagement_active and self.state.current_tick < max_ticks:
+            blue_obs = build_obs(self.state, Side.BLUE)
+            red_obs  = build_obs(self.state, Side.RED)
+
+            blue_actions = self.blue.decide(blue_obs)
+            red_actions = self.red.decide(red_obs)
+
+            calculate_attrition(self.state, blue_actions, red_actions)
+            
+
+            
+
+
+            update_zone_3_ticks(self.state)
+            check_win_condition(state=self.state)
+            self.state = self.state.model_copy(update={"current_tick": self.state.current_tick + 1})
+            
+        
+        return self.state
+
+
+
+
+
+
+
+================================================================================
+FILE: ./ares-sim/core/zones.py
+================================================================================
+
+
+from core.state import ZoneControl
+from config.settings import ZONE_CONTEST_RATIO
+
+
+def determine_zone_control(
+    red_units: int,
+    blue_units: int,
+) -> ZoneControl:
+    # No forces present
+    if red_units == 0 and blue_units == 0:
+        return ZoneControl.NEUTRAL
+
+    # One side completely absent
+    if red_units == 0:
+        return ZoneControl.BLUE
+
+    if blue_units == 0:
+        return ZoneControl.RED
+
+    # Relative force comparison
+    smaller_force = min(red_units, blue_units)
+    larger_force = max(red_units, blue_units)
+
+    ratio = smaller_force / larger_force
+
+    # Forces are close enough that neither side has control
+    if ratio >= ZONE_CONTEST_RATIO:
+        return ZoneControl.CONTESTED
+
+    # Red has clear superiority
+    if red_units > blue_units:
+        return ZoneControl.RED
+
+    # Blue has clear superiority
+    return ZoneControl.BLUE
+
+def update_zone_3_ticks(current_control: ZoneControl , previous_control: ZoneControl
+                        ,consecutive_ticks: int) -> int:
+    
+    if current_control in (
+    ZoneControl.NEUTRAL,
+    ZoneControl.CONTESTED):
+        return 0
+    if current_control ==previous_control:
+        return consecutive_ticks + 1
+    return 1
+
+
+================================================================================
+FILE: ./ares-sim/core/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/memory/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/simulation/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/__init__.py
+================================================================================
+
+print("Hello World")
+
+
+================================================================================
+FILE: ./database/migrations/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./database/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./logs/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./scripts/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./tests/__init__.py
+================================================================================
+
+

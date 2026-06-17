@@ -19,13 +19,16 @@ def calculate_attrition(
     attacker_controls_zone_3: bool,
 ) -> AttritionResult:
     # Base losses before any modifiers
-    attacker_losses = defender_units * 0.3
-    defender_losses = attacker_units * 0.4
+    attacker_losses = defender_units * 0.05
+    defender_losses = attacker_units * 0.06
 
     fuel_penalty = 0
 
     # Numerical advantage modifier
-    force_ratio = math.sqrt(attacker_units / max(defender_units, 1))
+    force_ratio = min(
+    math.sqrt(attacker_units / max(defender_units, 1)),
+    2.0,
+)
 
     # Larger attacking force inflicts proportionally more losses
     defender_losses *= force_ratio
@@ -40,7 +43,10 @@ def calculate_attrition(
         fuel_penalty = 10
 
     # Fuel level impacts sortie effectiveness
-    fuel_effectiveness = attacker_fuel / 150
+    fuel_effectiveness = max(
+    0.5,
+    min(attacker_fuel / 150, 1.0),
+)
     defender_losses *= fuel_effectiveness
 
     # Weapons expenditure scales with engagement activity
