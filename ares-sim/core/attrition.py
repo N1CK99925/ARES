@@ -19,8 +19,9 @@ def calculate_attrition(
     attacker_controls_zone_3: bool,
 ) -> AttritionResult:
     # Base losses before any modifiers
-    attacker_losses = defender_units * 0.05
-    defender_losses = attacker_units * 0.06
+    # Schema decision: attacker loses 8% of defender units, defender loses 5% of attacker units
+    attacker_losses = defender_units * 0.08
+    defender_losses = attacker_units * 0.05
 
     fuel_penalty = 0
 

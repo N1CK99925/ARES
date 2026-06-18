@@ -1,6 +1,6 @@
-from core.state import BattleState, Side, ZoneControl, ZoneSnapshot
+from core.state import BattleState, Side, ZoneControl
 from core.obs import build_obs
-from agents.commander import ActionType, Commander
+from agents.commander import ActionType
 from core.attrition import calculate_attrition
 from core.zones import determine_zone_control, update_zone_3_ticks
 from core.outcomes import check_win_condition
@@ -26,6 +26,90 @@ class TickEngine:
         self.state = state
         self.blue = blue_commander
         self.red = red_commander
+        # Enemy memory: {Side -> {zone, units, tick_seen}}
+        # Persists across ticks; updated only when enemy visible in controlled zones
+        self.enemy_memory: dict[Side, dict[str, int | None]] = {
+            Side.BLUE: {"zone": None, "units": None, "tick_seen": None},
+            Side.RED: {"zone": None, "units": None, "tick_seen": None},
+        }
+
+    def _get_visible_zones_for_side(self, side: Side) -> set[int]:
+        """Compute zones visible to a side based on control.
+        
+        A zone is visible if:
+        - The side controls it directly, OR
+        - The side controls an adjacent zone
+        
+        This represents scouting/intelligence presence.
+        """
+        visible = set()
+        
+        for zone in self.state.zones:
+            # Check if we control this zone
+            if side == Side.BLUE and zone.side_control == ZoneControl.BLUE:
+                visible.add(zone.zone_id)
+            elif side == Side.RED and zone.side_control == ZoneControl.RED:
+                visible.add(zone.zone_id)
+            else:
+                # Check if we control an adjacent zone
+                adjacent_zone_ids = ADJACENCY.get(zone.zone_id, [])
+                for adj_id in adjacent_zone_ids:
+                    adj_zone = next(
+                        (z for z in self.state.zones if z.zone_id == adj_id),
+                        None,
+                    )
+                    if adj_zone is None:
+                        continue
+                    
+                    if side == Side.BLUE and adj_zone.side_control == ZoneControl.BLUE:
+                        visible.add(zone.zone_id)
+                        break
+                    elif side == Side.RED and adj_zone.side_control == ZoneControl.RED:
+                        visible.add(zone.zone_id)
+                        break
+        
+        return visible
+    
+    def _update_enemy_memory(self, side: Side) -> None:
+        """Update memory for a side based on current visibility.
+        
+        If enemy is visible in any visible zone, update memory with the
+        closest enemy zone and unit count. If not visible, memory persists
+        (this is the decay mechanic: stale info remains until refreshed).
+        """
+        visible_zones = self._get_visible_zones_for_side(side)
+        
+        # Find enemy in any visible zone
+        enemy_side = Side.RED if side == Side.BLUE else Side.BLUE
+        
+        closest_enemy_zone = None
+        enemy_units_in_closest = None
+        min_distance_to_ref = float("inf")
+        ref_zone = 2 if side == Side.BLUE else 4
+        
+        for zone in self.state.zones:
+            if zone.zone_id not in visible_zones:
+                continue
+            
+            enemy_count = (
+                zone.red_units if side == Side.BLUE else zone.blue_units
+            )
+            
+            if enemy_count > 0:
+                distance = abs(zone.zone_id - ref_zone)
+                if distance < min_distance_to_ref:
+                    min_distance_to_ref = distance
+                    closest_enemy_zone = zone.zone_id
+                    enemy_units_in_closest = enemy_count
+        
+        # If enemy found in visible zones, update memory
+        if closest_enemy_zone is not None:
+            self.enemy_memory[side] = {
+                "zone": closest_enemy_zone,
+                "units": enemy_units_in_closest,
+                "tick_seen": self.state.current_tick,
+            }
+        # else: memory unchanged (stale sighting persists)
 
     def _compute_attacker_controls_flank(self, action_side: Side, target_zone_id: int) -> bool:
         """
@@ -54,9 +138,13 @@ class TickEngine:
 
     def run(self, max_ticks) -> BattleState:
         while self.state.is_engagement_active and self.state.current_tick < max_ticks:
-            # Collect actions from both sides
-            blue_obs = build_obs(self.state, Side.BLUE)
-            red_obs = build_obs(self.state, Side.RED)
+            # Update enemy memory for both sides based on current zone control
+            self._update_enemy_memory(Side.BLUE)
+            self._update_enemy_memory(Side.RED)
+            
+            # Collect actions from both sides using their memory-based observations
+            blue_obs = build_obs(self.state, Side.BLUE, self.enemy_memory[Side.BLUE])
+            red_obs = build_obs(self.state, Side.RED, self.enemy_memory[Side.RED])
 
             blue_actions = self.blue.decide(blue_obs)
             red_actions = self.red.decide(red_obs)
@@ -200,7 +288,7 @@ class TickEngine:
             if zone_3:
                 new_consecutive_ticks = update_zone_3_ticks(
                     current_control=zone_3.side_control,
-                    previous_control=prev_zone_3_control,
+                    previous_control=prev_zone_3_control or zone_3.side_control,
                     consecutive_ticks=self.state.zone_3_consecutive_ticks,
                 )
                 self.state = self.state.model_copy(
@@ -208,7 +296,7 @@ class TickEngine:
                 )
             
             # Check win condition
-            check_win_condition(state=self.state)
+            self.state = check_win_condition(state=self.state)
             
             # Advance tick
             self.state = self.state.model_copy(

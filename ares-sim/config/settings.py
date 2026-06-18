@@ -8,7 +8,7 @@ class Settings(BaseSettings):
 
 
 ZONE_CONTEST_RATIO= 0.9
-ZONE_3_WIN_THRESHOLD=0
+ZONE_3_WIN_THRESHOLD=6
 
 ADJACENCY = {
     1: [2],
