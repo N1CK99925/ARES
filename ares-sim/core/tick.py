@@ -1,6 +1,6 @@
 from core.state import BattleState, Side, ZoneControl
 from core.obs import build_obs
-from agents.commander import ActionType
+from agents.models import ActionType
 from core.attrition import calculate_attrition
 from core.zones import determine_zone_control, update_zone_3_ticks
 from core.outcomes import check_win_condition
@@ -80,7 +80,7 @@ class TickEngine:
         visible_zones = self._get_visible_zones_for_side(side)
         
         # Find enemy in any visible zone
-        enemy_side = Side.RED if side == Side.BLUE else Side.BLUE
+        # enemy_side = Side.RED if side == Side.BLUE else Side.BLUE
         
         closest_enemy_zone = None
         enemy_units_in_closest = None
@@ -169,7 +169,11 @@ class TickEngine:
                     (z for z in self.state.zones if z.zone_id == action.target_zone),
                     None,
                 )
+                allowed_targets = ADJACENCY.get(action.source_zone,[])
                 if source_zone_snapshot is None or target_zone_snapshot is None:
+                    actions_rejected_per_side[action.side] += 1
+                    continue
+                if action.target_zone not in allowed_targets:
                     actions_rejected_per_side[action.side] += 1
                     continue
 

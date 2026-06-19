@@ -7,3 +7,4 @@ pytest
 pydantic-settings
 litellm
 pathlib
+instructor
