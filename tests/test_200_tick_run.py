@@ -7,7 +7,7 @@ Track which win path fires: zone-3 hold, elimination, or timeout.
 import sys
 sys.path.insert(0, 'ares-sim')
 
-from core.tick import TickEngine
+from .core.tick import TickEngine
 from config.seeds import get_seed_1
 from agents.commander import Commander
 import logging
