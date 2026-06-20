@@ -26,6 +26,7 @@ litellm.enable_json_schema_validation = True
 
 class LLMCommander(BaseCommander):
     def __init__(self, model: str):
+        super().__init__()
         self.model = model
 
     def _hold_decision(
@@ -102,23 +103,23 @@ class LLMCommander(BaseCommander):
                     stream=False,
                 ),
             )
-
-            return self._parse_response(response)
-
+            decision = self._parse_response(response)
+            self.last_call_outcome = "success"
+            return decision
         except Exception:
             pass
 
-        try:
-            retry_messages = messages + [
-                {
-                    "role": "user",
-                    "content": (
-                        "Your previous response failed validation. "
-                        "Return a valid CommanderDecision and obey the schema."
-                    ),
-                }
-            ]
+        retry_messages = messages + [
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response failed validation. "
+                    "Return a valid CommanderDecision and obey the schema."
+                ),
+            }
+        ]
 
+        try:
             response = cast(
                 ModelResponse,
                 completion(
@@ -128,12 +129,24 @@ class LLMCommander(BaseCommander):
                     stream=False,
                 ),
             )
-
-            return self._parse_response(response)
-
         except Exception:
+            # API call itself failed on retry.
+            self.last_call_outcome = "hold_fallback_api"
             return self._hold_decision(
                 obs,
                 memory,
-                "Held all positions due to LLM failure",
+                "Held all positions due to LLM API failure",
+            )
+
+        try:
+            decision = self._parse_response(response)
+            self.last_call_outcome = "retry_success"
+            return decision
+        except Exception:
+            # Retry API call succeeded but response failed schema validation.
+            self.last_call_outcome = "hold_fallback_validation"
+            return self._hold_decision(
+                obs,
+                memory,
+                "Held all positions due to schema validation failure",
             )

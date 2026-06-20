@@ -1,5 +1,8 @@
 {
   "venvPath": ".",
-  "venv": ".venv"
+  "venv": ".venv",
+  "extraPaths": [
+    "ares-sim",
+    "tests"
+  ]
 }
-
