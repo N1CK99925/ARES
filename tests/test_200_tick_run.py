@@ -7,9 +7,8 @@ Track which win path fires: zone-3 hold, elimination, or timeout.
 import sys
 sys.path.insert(0, 'ares-sim')
 
-from .core.tick import TickEngine
+from core.tick import TickEngine
 from config.seeds import get_seed_1
-from agents.commander import Commander
 import logging
 
 logging.basicConfig(
@@ -22,11 +21,14 @@ logger = logging.getLogger('TEST')
 class DummyCommander:
     def __init__(self, side):
         self.side = side
+        self.last_call_outcome = "success"
     
-    def decide(self, obs):
-        from agents.commander import Actions, CommanderAction, ActionType
+    def decide(self, obs, memory=None):
+        from agents.models import Actions, CommanderAction, ActionType, CommanderDecision, CommanderMemory
+        if memory is None:
+            memory = CommanderMemory(current_objective="", last_action_summary="", tick_of_last_strategy_changed=None)
         # Always hold (no-op actions)
-        return Actions(actions=[])
+        return CommanderDecision(actions=Actions(actions=[]), memory=memory)
 
 def run_test():
     """Run 200 ticks and report results."""

@@ -1,18 +1,24 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import sys
 sys.path.insert(0, 'ares-sim')
 
 from core.tick import TickEngine
 from config.seeds import get_seed_1
-from agents.commander import Actions
+from agents.models import Actions
 import logging
 
 logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
 logger = logging.getLogger('TEST')
 
 class DummyCommander:
-    def decide(self, obs):
-        return Actions(actions=[])
+    def __init__(self):
+        self.last_call_outcome = "success"
+
+    def decide(self, obs, memory=None):
+        from agents.models import CommanderDecision, CommanderMemory
+        if memory is None:
+            memory = CommanderMemory(current_objective="", last_action_summary="", tick_of_last_strategy_changed=None)
+        return CommanderDecision(actions=Actions(actions=[]), memory=memory)
 
 state = get_seed_1()
 engine = TickEngine(state, DummyCommander(), DummyCommander())

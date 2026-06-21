@@ -1,7 +1,9 @@
 import pytest
-from  ares-sim.core.zones import  determine_zone_control
-from  import ZoneControl
+import sys
+sys.path.insert(0, 'ares-sim')
 
+from core.zones import determine_zone_control
+from core.state import ZoneControl
 
 class TestDetermineZoneControl:
     """Unit tests for zone control determination logic."""
