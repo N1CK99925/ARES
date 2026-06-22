@@ -108,3 +108,10 @@ OUTPUT REQUIREMENT
 
 - Return a list of zero or more valid actions, each conforming exactly to the schema above, with no additional commentary. 
 - Return a CommanderDecision containing both your action list (zero or more valid actions, each conforming exactly to the schema above) and your updated memory (per the schema above)
+
+
+**🚨 ACTION SEMANTICS – READ CAREFULLY**
+- `"hold"` → **No movement**. Units stay in `source_zone`. `target_zone` must equal `source_zone`.
+- `"move"` → **Movement occurs**. Units travel from `source_zone` to `target_zone` (which must be adjacent).
+- If you issue a `hold` with `target_zone != source_zone`, the action is **rejected** and does nothing.
+- Do not use `"hold"` to mean "move and then defend" – that is two separate actions (move first, hold later).

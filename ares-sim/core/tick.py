@@ -4,13 +4,14 @@ import logging
 
 from core.state import BattleState, Side, ZoneControl
 from core.obs import build_obs
-from agents.models import ActionType, TickLogEntry
+from agents.models import ActionType   
 from agents.Commander.BaseCommander import BaseCommander
 from core.outcomes import check_win_condition
 from core.zones import update_zone_3_ticks
-from core.intel import get_visible_zones_for_side, update_enemy_memory
+from core.intel import update_enemy_memory
 from core.action_resolver import resolve_actions
 from core.state_updater import apply_deltas
+from agents.models import FullTickSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,11 @@ class TickEngine:
         self.blue = blue_commander
         self.red = red_commander
         self.log_path = pathlib.Path(log_path) if log_path else None
+        if self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file_handle = self.log_path.open("w", encoding="utf-8")
+        else:
+            self.log_file_handle = None
         self.tick_log: list[TickLogEntry] = []
         # Enemy memory: {Side -> {zone, units, tick_seen}}
         # Persists across ticks; updated only when enemy visible in controlled zones
@@ -47,7 +53,7 @@ class TickEngine:
         # Initialize/truncate the log file if a path is provided
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.log_path.open("w", encoding="utf-8").close()
+            
 
         # Seed initial memory for each side — commanders update and return
         # new memory each tick; we thread it forward.
@@ -83,24 +89,7 @@ class TickEngine:
             time.sleep(SLEEP_SECONDS)
 
             # Build log entries for this tick (before actions are resolved)
-            for side, decision, outcome, commander in [
-                (Side.BLUE, blue_decision, blue_outcome, self.blue),
-                (Side.RED,  red_decision,  red_outcome, self.red),
-            ]:
-                entry = TickLogEntry(
-                    tick=self.state.current_tick,
-                    side=side,
-                    call_outcome=outcome,
-                    actions=decision.actions,
-                    current_objective=decision.memory.current_objective,
-                    last_action_summary=decision.memory.last_action_summary,
-                    tick_of_last_strategy_changed=decision.memory.tick_of_last_strategy_changed,
-                    error_details=getattr(commander, "last_error", None),
-                )
-                self.tick_log.append(entry)
-                if self.log_path:
-                    with self.log_path.open("a", encoding="utf-8") as fh:
-                        fh.write(entry.model_dump_json() + "\n")
+            
 
             # BUG FIX: .actions on a CommanderDecision is an Actions model;
             # .actions.actions is the underlying list[CommanderAction].
@@ -145,10 +134,48 @@ class TickEngine:
             
             # Check win condition
             self.state = check_win_condition(state=self.state)
+
+
+            if self.log_file_handle:
+                snapshot = FullTickSnapshot(
+                    tick=self.state.current_tick,
+                    is_engagement_active=self.state.is_engagement_active,
+                    battle_winner=self.state.battle_winner,
+                    zones=self.state.zones, # Ground truth
+                    red_fuel=self.state.red_fuel,
+                    blue_fuel=self.state.blue_fuel,
+                    red_weapons_remaining=self.state.red_weapons_remaining,
+                    blue_weapons_remaining=self.state.blue_weapons_remaining,
+                    zone_3_consecutive_ticks=self.state.zone_3_consecutive_ticks,
+                    blue_observation=blue_obs,  # What Blue saw
+                    red_observation=red_obs,    # What Red saw
+                    blue_decision=blue_decision, # What Blue ordered
+                    red_decision=red_decision,   # What Red ordered
+                    blue_actions_taken=actions_taken[Side.BLUE],
+                    blue_actions_rejected=actions_rejected[Side.BLUE],
+                    red_actions_taken=actions_taken[Side.RED],
+                    red_actions_rejected=actions_rejected[Side.RED],
+                    total_deltas_applied=len(pending_deltas),
+                )
+                # Write as a single JSON line
+                self.log_file_handle.write(snapshot.model_dump_json() + "\n")
+                self.log_file_handle.flush()  # Ensure it's written to disk immediately
+
+            # Human-readable console logging (very useful for watching it live)
+            logger.info(
+                f"Tick {self.state.current_tick}: "
+                f"Blue: {actions_taken[Side.BLUE]} taken, {actions_rejected[Side.BLUE]} rej | "
+                f"Red: {actions_taken[Side.RED]} taken, {actions_rejected[Side.RED]} rej | "
+                f"Z3 Control: {zone_3.side_control if zone_3 else 'N/A'} ({self.state.zone_3_consecutive_ticks})"
+            )
+
             
             # Advance tick
             self.state = self.state.model_copy(
                 update={"current_tick": self.state.current_tick + 1}
             )
+
+        if self.log_file_handle:
+            self.log_file_handle.close()
 
         return self.state
