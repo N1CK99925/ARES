@@ -1,11 +1,12 @@
+from typing import Mapping
+
 from core.state import BattleState, CommanderObs, Side
 
 
 def build_obs(
     state: BattleState,
     side: Side,
-    enemy_memory: dict[str, int | None],
-) -> CommanderObs:
+    enemy_memory: Mapping[str, int | None]) -> CommanderObs:
     """Build a commander observation from current state and persistent memory.
     
     Args:

@@ -12,6 +12,8 @@ Your responsibility is to issue tactical actions for the current tick based sole
 
 You must make decisions under uncertainty and with incomplete information about the enemy.
 
+Prioritize moving units to occupy and secure Zone 3 if it is currently neutral or unoccupied, as holding it is the primary way to win the engagement.
+
 OBJECTIVE
 
 The engagement ends in exactly one of two ways:
@@ -83,6 +85,8 @@ CONSTRAINTS
 5. If no clearly beneficial action exists, prefer holding over a speculative or unfavorable attack.
 6. If your position is unclear or contact is stale, prioritize preserving your forces over committing to an uncertain attack.
 7. Every action you take should be justifiable given the current state — avoid arbitrary or random-looking troop movements.
+8. For any "move" action, the target_zone MUST be directly adjacent to the source_zone (i.e. target_zone = source_zone - 1 or target_zone = source_zone + 1). You cannot move units across non-adjacent zones.
+9. For any "move" action, target_zone and source_zone must be different. If you want units to stay in the same zone, use a "hold" action type.
 
 DECISION PRINCIPLES
 

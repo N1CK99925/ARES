@@ -2,7 +2,13 @@ import json
 from pathlib import Path
 from typing import cast
 
+import os
+
+
 import litellm
+
+os.environ["LITELLM_LOG"] = "DEBUG"
+
 from litellm import completion
 from litellm.types.utils import ModelResponse
 
@@ -20,6 +26,7 @@ from agents.Commander.BaseCommander import BaseCommander
 CommanderPrompt = (
     Path(__file__).parent.parent.parent / "prompts" / "commander_prompt.md"
 ).read_text()
+
 
 litellm.enable_json_schema_validation = True
 
@@ -128,6 +135,7 @@ class LLMCommander(BaseCommander):
                     messages=messages,
                     response_format={"type": "json_object"},
                     stream=False,
+                    max_retries=0,
                 ),
             )
             decision = self._parse_response(response)
@@ -136,6 +144,7 @@ class LLMCommander(BaseCommander):
         except Exception as e:
             print(f"Error type: {type(e).__name__}")
             print(f"Error message: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
 
         retry_messages = messages + [
             {
@@ -155,10 +164,14 @@ class LLMCommander(BaseCommander):
                     messages=retry_messages,
                     response_format={"type": "json_object"},
                     stream=False,
+                    max_retries=0,
                 ),
             )
-        except Exception:
-            
+        except Exception as e:
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
+                    
             self.last_call_outcome = "hold_fallback_api"
             return self._hold_decision(
                 obs,
@@ -170,7 +183,10 @@ class LLMCommander(BaseCommander):
             decision = self._parse_response(response)
             self.last_call_outcome = "retry_success"
             return decision
-        except Exception:
+        except Exception as e:
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
             
             self.last_call_outcome = "hold_fallback_validation"
             return self._hold_decision(

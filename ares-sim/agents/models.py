@@ -41,3 +41,5 @@ class TickLogEntry(BaseModel):
     current_objective: str
     last_action_summary: str
     tick_of_last_strategy_changed: int | None
+    error_details: str | None = None
+    

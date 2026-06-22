@@ -1,6 +1,6 @@
 import pathlib
 from core.state import BattleState, Side, ZoneControl
-
+import time
 from core.obs import build_obs
 from agents.models import ActionType, TickLogEntry
 from agents.Commander.BaseCommander import BaseCommander
@@ -10,6 +10,7 @@ from core.outcomes import check_win_condition
 from config.settings import ADJACENCY
 from typing import NamedTuple
 import logging
+
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,12 @@ class Delta(NamedTuple):
     fuel_delta: int
     weapons_delta: int
 
+TPM_LIMIT = 6000
+SAFETY_MARGIN = 0.8
+TOKENS_PER_CALL = 2100  
+CALLS_PER_TICK = 2 
+
+SLEEP_SECONDS = 60 * (TOKENS_PER_CALL * CALLS_PER_TICK) / (TPM_LIMIT * SAFETY_MARGIN)
 
 class TickEngine:
     def __init__(
@@ -150,6 +157,11 @@ class TickEngine:
     def run(self, max_ticks: int) -> BattleState:
         from agents.models import CommanderMemory
 
+        # Initialize/truncate the log file if a path is provided
+        if self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_path.open("w", encoding="utf-8").close()
+
         # Seed initial memory for each side — commanders update and return
         # new memory each tick; we thread it forward.
         blue_memory = CommanderMemory(
@@ -180,13 +192,16 @@ class TickEngine:
             # Thread updated memory forward to the next tick
             blue_memory = blue_decision.memory
             red_memory = red_decision.memory
+            
+
+            time.sleep(SLEEP_SECONDS)
 
             # Build log entries for this tick (before actions are resolved)
-            for side, decision, outcome in [
-                (Side.BLUE, blue_decision, blue_outcome),
-                (Side.RED,  red_decision,  red_outcome),
+            for side, decision, outcome , commander in [
+                (Side.BLUE, blue_decision, blue_outcome, self.blue),
+                (Side.RED,  red_decision,  red_outcome,self.red),
             ]:
-                self.tick_log.append(TickLogEntry(
+                entry = TickLogEntry(
                     tick=self.state.current_tick,
                     side=side,
                     call_outcome=outcome,
@@ -194,7 +209,12 @@ class TickEngine:
                     current_objective=decision.memory.current_objective,
                     last_action_summary=decision.memory.last_action_summary,
                     tick_of_last_strategy_changed=decision.memory.tick_of_last_strategy_changed,
-                ))
+                    error_details=getattr(commander, "last_error", None),
+                )
+                self.tick_log.append(entry)
+                if self.log_path:
+                    with self.log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(entry.model_dump_json() + "\n")
 
             # BUG FIX: .actions on a CommanderDecision is an Actions model;
             # .actions.actions is the underlying list[CommanderAction].
@@ -358,13 +378,6 @@ class TickEngine:
             self.state = self.state.model_copy(
                 update={"current_tick": self.state.current_tick + 1}
             )
-
-        # Write tick log as JSONL if a path was provided
-        if self.log_path:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.log_path.open("w", encoding="utf-8") as fh:
-                for entry in self.tick_log:
-                    fh.write(entry.model_dump_json() + "\n")
 
         return self.state
 

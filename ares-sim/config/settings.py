@@ -18,3 +18,5 @@ ADJACENCY = {
     5: [4],
 }
 
+settings = Settings()
+
