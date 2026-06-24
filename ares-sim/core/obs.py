@@ -1,5 +1,5 @@
 from typing import Mapping
-
+from config.settings import ADJACENCY
 from core.state import BattleState, CommanderObs, Side
 
 
@@ -40,6 +40,12 @@ def build_obs(
     else:
         how_many_ticks_ago_enemy_last_seen = None
 
+    legal_targets_per_zone = {
+            zone_id : ADJACENCY.get(zone_id,[])
+            for zone_id, count in own_units.items()
+            if count > 0
+            }
+
     return CommanderObs(
         side=side,
         current_tick=state.current_tick,
@@ -49,6 +55,7 @@ def build_obs(
         enemy_last_known_unit_count=last_enemy_known_units,
         enemy_last_known_zone=last_enemy_known_zone,
         how_many_ticks_ago_enemy_last_seen=how_many_ticks_ago_enemy_last_seen,
+        legal_targets_per_zone=legal_targets_per_zone
     )
 
 

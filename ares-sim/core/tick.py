@@ -4,7 +4,7 @@ import logging
 
 from core.state import BattleState, Side, ZoneControl
 from core.obs import build_obs
-from agents.models import ActionType   
+from agents.models import ActionType  ,TickLogEntry
 from agents.Commander.BaseCommander import BaseCommander
 from core.outcomes import check_win_condition
 from core.zones import update_zone_3_ticks
@@ -14,14 +14,13 @@ from core.state_updater import apply_deltas
 from agents.models import FullTickSnapshot
 
 logger = logging.getLogger(__name__)
-
-TPM_LIMIT = 6000
+TPM_LIMIT = 8000
 SAFETY_MARGIN = 0.8
-TOKENS_PER_CALL = 2100  
-CALLS_PER_TICK = 2 
+TOKENS_PER_CALL = 2328 + 900  # input + conservative output ceiling at low effort ≈ 3228
+CALLS_PER_TICK = 2
+
 SLEEP_SECONDS = 60 * (TOKENS_PER_CALL * CALLS_PER_TICK) / (TPM_LIMIT * SAFETY_MARGIN)
-
-
+# = 60 * 6456 / 6400 ≈ 60.5s/tick
 class TickEngine:
     def __init__(
         self,
@@ -76,12 +75,25 @@ class TickEngine:
             # Collect decisions from both sides (obs + memory in, decision + new memory out)
             blue_obs = build_obs(self.state, Side.BLUE, self.enemy_memory[Side.BLUE])
             red_obs = build_obs(self.state, Side.RED, self.enemy_memory[Side.RED])
+            if self.state.current_tick % 2 == 0:
+                turn_order = [
+                    (Side.BLUE, self.blue, blue_obs),
+                    (Side.RED, self.red, red_obs),
+                ]
+            else:
+                turn_order = [
+                    (Side.RED, self.red, red_obs),
+                    (Side.BLUE, self.blue, blue_obs),
+                ]
 
-            blue_decision = self.blue.decide(blue_obs, blue_memory)
-            blue_outcome = self.blue.last_call_outcome
-            red_decision = self.red.decide(red_obs, red_memory)
-            red_outcome = self.red.last_call_outcome
+            results = {}
+            for side, commander, obs in turn_order:
+                mem = blue_memory if side == Side.BLUE else red_memory
+                results[side] = (commander.decide(obs, mem), commander.last_call_outcome)
+                time.sleep(5)  # small gap between same-tick calls
 
+            blue_decision, blue_outcome = results[Side.BLUE]
+            red_decision, red_outcome = results[Side.RED]
             # Thread updated memory forward to the next tick
             blue_memory = blue_decision.memory
             red_memory = red_decision.memory

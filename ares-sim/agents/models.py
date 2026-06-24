@@ -36,15 +36,15 @@ CallOutcome = Literal[
 ]
 
 
-# class TickLogEntry(BaseModel):
-#     tick: int
-#     side: Side
-#     call_outcome: CallOutcome
-#     actions: Actions
-#     current_objective: str
-#     last_action_summary: str
-#     tick_of_last_strategy_changed: int | None
-#     error_details: str | None = None
+class TickLogEntry(BaseModel):
+    tick: int
+    side: Side
+    call_outcome: CallOutcome
+    actions: Actions
+    current_objective: str
+    last_action_summary: str
+    tick_of_last_strategy_changed: int | None
+    error_details: str | None = None
 
 
 

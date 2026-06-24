@@ -106,5 +106,13 @@ class CommanderObs(BaseModel):
         description="Ticks elapsed since the last confirmed enemy sighting.",
     )
     model_config = ConfigDict(frozen=True)
-
+    
+    legal_targets_per_zone: dict[int, list[int]] = Field(
+    default_factory=dict,
+    description=(
+        "For each zone you currently occupy, the exact list of zone_ids "
+        "you are permitted to target with a move action. Use this directly "
+        "as the source of truth for adjacency — do not infer adjacency yourself."
+    ),
+)
 

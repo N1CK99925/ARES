@@ -1,13 +1,13 @@
 import json
 from pathlib import Path
 from typing import cast
-
+import time
 import os
 
 
 import litellm
 
-os.environ["LITELLM_LOG"] = "DEBUG"
+os.environ["LITELLM_LOG"] = "INFO"
 
 from litellm import completion
 from litellm.types.utils import ModelResponse
@@ -136,6 +136,8 @@ class LLMCommander(BaseCommander):
                     response_format={"type": "json_object"},
                     stream=False,
                     max_retries=0,
+                    reasoning_effort="low",
+                    max_tokens=1600
                 ),
             )
             decision = self._parse_response(response)
@@ -145,7 +147,7 @@ class LLMCommander(BaseCommander):
             print(f"Error type: {type(e).__name__}")
             print(f"Error message: {e}")
             self.last_error = f"{type(e).__name__}: {e}"
-
+            time.sleep(5)  
         retry_messages = messages + [
             {
                 "role": "user",
@@ -165,6 +167,8 @@ class LLMCommander(BaseCommander):
                     response_format={"type": "json_object"},
                     stream=False,
                     max_retries=0,
+                    max_tokens=1600,
+                    reasoning_effort="low"
                 ),
             )
         except Exception as e:
