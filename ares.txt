@@ -14,10 +14,44 @@ class BaseCommander(ABC):
     def __init__(self) -> None:
         
         self.last_call_outcome: CallOutcome = "success"
+        self.last_error : str | None= None
 
     @abstractmethod
     def decide(self, obs: CommanderObs, memory: Any) -> CommanderDecision:
         pass
+
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/Commander/DQNCommander.py
+================================================================================
+
+from agents.Commander.BaseCommander import BaseCommander
+from agents.RL.DQN.encoder import ObservationEncoder
+from RL.DQN.network import DQNNetwork
+from core.state import CommanderObs
+class DQNCommander(BaseCommander):
+    def __init__(self):
+        super().__init__()
+
+
+    def decide(self, obs: CommanderObs , memory):
+        pass
+
+    def train_step(self):
+        pass
+
+    def remember(self):
+        pass
+
+
+    def save(self):
+        pass
+
+    def load(self):
+        pass
+
 
 
 
@@ -29,13 +63,13 @@ FILE: ./ares-sim/agents/Commander/LLMCommander.py
 import json
 from pathlib import Path
 from typing import cast
-
+import time
 import os
 
 
 import litellm
 
-os.environ["LITELLM_LOG"] = "DEBUG"
+os.environ["LITELLM_LOG"] = "INFO"
 
 from litellm import completion
 from litellm.types.utils import ModelResponse
@@ -164,6 +198,8 @@ class LLMCommander(BaseCommander):
                     response_format={"type": "json_object"},
                     stream=False,
                     max_retries=0,
+                    reasoning_effort="low",
+                    max_tokens=1600
                 ),
             )
             decision = self._parse_response(response)
@@ -172,7 +208,8 @@ class LLMCommander(BaseCommander):
         except Exception as e:
             print(f"Error type: {type(e).__name__}")
             print(f"Error message: {e}")
-
+            self.last_error = f"{type(e).__name__}: {e}"
+            time.sleep(5)  
         retry_messages = messages + [
             {
                 "role": "user",
@@ -192,10 +229,15 @@ class LLMCommander(BaseCommander):
                     response_format={"type": "json_object"},
                     stream=False,
                     max_retries=0,
+                    max_tokens=1600,
+                    reasoning_effort="low"
                 ),
             )
-        except Exception:
-            
+        except Exception as e:
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
+                    
             self.last_call_outcome = "hold_fallback_api"
             return self._hold_decision(
                 obs,
@@ -207,7 +249,10 @@ class LLMCommander(BaseCommander):
             decision = self._parse_response(response)
             self.last_call_outcome = "retry_success"
             return decision
-        except Exception:
+        except Exception as e:
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
             
             self.last_call_outcome = "hold_fallback_validation"
             return self._hold_decision(
@@ -224,6 +269,20 @@ FILE: ./ares-sim/agents/Commander/QMIXCommander.py
 
 
 ================================================================================
+FILE: ./ares-sim/agents/Commander/RandomCommander.py
+================================================================================
+
+from  agents.Commander.BaseCommander import BaseCommander
+from  agents.models import CommanderDecision,CommanderObs 
+class RandomCommaner(BaseCommander):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def decide(self, obs: CommanderObs, memory: None ) -> CommanderDecision:
+        return super().decide(obs, memory)
+
+
+================================================================================
 FILE: ./ares-sim/agents/models.py
 ================================================================================
 
@@ -231,6 +290,9 @@ from pydantic import BaseModel
 from enum import Enum
 from typing import Literal
 from core.state import Side
+from core.state import BattleState, CommanderObs, ZoneSnapshot 
+
+
 class ActionType(str, Enum):
     HOLD= "hold"
     MOVE= "move"
@@ -270,6 +332,172 @@ class TickLogEntry(BaseModel):
     current_objective: str
     last_action_summary: str
     tick_of_last_strategy_changed: int | None
+    error_details: str | None = None
+
+
+
+class FullTickSnapshot(BaseModel):
+    tick: int
+    is_engagement_active: bool
+    battle_winner: Side | None
+
+    # 1. GROUND TRUTH (What actually happened)
+    zones: list[ZoneSnapshot]
+    red_fuel: int
+    blue_fuel: int
+    red_weapons_remaining: int
+    blue_weapons_remaining: int
+    zone_3_consecutive_ticks: int
+
+    # 2. PARTIAL OBSERVATIONS (What each side *thinks* is happening)
+    blue_observation: CommanderObs
+    red_observation: CommanderObs
+
+    # 3. DECISIONS MADE (Their orders)
+    blue_decision: CommanderDecision
+    red_decision: CommanderDecision
+
+    # 4. RESOLUTION METRICS (How many orders actually worked)
+    blue_actions_taken: int
+    blue_actions_rejected: int
+    red_actions_taken: int
+    red_actions_rejected: int
+    total_deltas_applied: int
+    # Optional: List the actual deltas if you want extreme verbosity
+    # applied_deltas: list[Delta] 
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/encoder.py
+================================================================================
+
+import torch
+
+from core.state import CommanderObs, Side
+
+
+class ObservationEncoder:
+    def encode(self, obs: CommanderObs) -> torch.Tensor:
+        features = []
+
+        # Side
+        features.append(0.0 if obs.side == Side.RED else 1.0)
+
+        # Current tick
+        features.append(float(obs.current_tick))
+
+        # Friendly units in each zone
+        for zone_id in sorted(obs.own_unit_per_zone.keys()):
+            features.append(float(obs.own_unit_per_zone[zone_id]))
+
+        # Resources
+        features.append(float(obs.own_fuel))
+        features.append(float(obs.own_weapons_remaining))
+
+        # Enemy information
+        features.append(
+            float(obs.enemy_last_known_unit_count)
+            if obs.enemy_last_known_unit_count is not None
+            else -1.0
+        )
+
+        features.append(
+            float(obs.enemy_last_known_zone)
+            if obs.enemy_last_known_zone is not None
+            else -1.0
+        )
+
+        features.append(
+            float(obs.how_many_ticks_ago_enemy_last_seen)
+            if obs.how_many_ticks_ago_enemy_last_seen is not None
+            else -1.0
+        )
+
+        return torch.tensor(
+         features,
+         dtype=torch.float32,
+).unsqueeze(0)
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/epsilon.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/network.py
+================================================================================
+
+import torch
+import torch.nn as nn
+
+
+class DQNNetwork(nn.Module):
+    def __init__(
+        self,
+        state_dim: int,
+        hidden_dim: int,
+        num_source_zones: int,
+        num_target_zones: int,
+        num_action_types: int,
+    ):
+        super().__init__()
+
+        # Shared encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+        # Multi-head outputs
+        self.source_head = nn.Linear(hidden_dim, num_source_zones)
+        self.target_head = nn.Linear(hidden_dim, num_target_zones)
+        self.action_head = nn.Linear(hidden_dim, num_action_types)
+
+    def forward(self, state: torch.Tensor):
+        """
+        state shape:
+            (batch_size, state_dim)
+        """
+
+        features = self.encoder(state)
+
+        source_q = self.source_head(features)
+        target_q = self.target_head(features)
+        action_q = self.action_head(features)
+
+        return {
+            "source": source_q,
+            "target": target_q,
+            "action": action_q,
+        }
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/replay_buffer.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/trainer.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/utils.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/__init__.py
+================================================================================
+
 
 
 ================================================================================
@@ -388,6 +616,184 @@ FILE: ./ares-sim/config/__init__.py
 
 
 ================================================================================
+FILE: ./ares-sim/core/action_resolver.py
+================================================================================
+
+from typing import NamedTuple
+
+from config.settings import ADJACENCY
+from core.attrition import calculate_attrition
+from core.state import BattleState, Side, ZoneControl
+from agents.models import ActionType
+
+
+class Delta(NamedTuple):
+    """Represents a unit/fuel change to apply to a zone."""
+    zone_id: int
+    side: Side
+    unit_delta: int
+    fuel_delta: int
+    weapons_delta: int
+
+
+def compute_attacker_controls_flank(state: BattleState, action_side: Side, target_zone_id: int) -> bool:
+    """
+    Determine if the attacker controls the flank by checking adjacent zones.
+    Attacker controls flank if they control adjacent zones.
+    """
+    adjacent_zone_ids = ADJACENCY.get(target_zone_id, [])
+
+    for adj_zone_id in adjacent_zone_ids:
+        adj_zone = next(
+            (z for z in state.zones if z.zone_id == adj_zone_id),
+            None,
+        )
+        if adj_zone is None:
+            continue
+
+        # Check if attacker controls this adjacent zone
+        if action_side == Side.BLUE:
+            if adj_zone.side_control == ZoneControl.BLUE:
+                return True
+        else:  # RED
+            if adj_zone.side_control == ZoneControl.RED:
+                return True
+
+    return False
+
+
+def resolve_actions(state: BattleState, all_actions: list) -> tuple:
+    """
+    Validate all actions and build deltas without mutating state.
+    
+    Returns:
+        pending_deltas: list of Delta objects to apply
+        actions_taken: dict of {Side: count}
+        actions_rejected: dict of {Side: count}
+    """
+    pending_deltas = []
+    actions_taken = {Side.BLUE: 0, Side.RED: 0}
+    actions_rejected = {Side.BLUE: 0, Side.RED: 0}
+    cumulative_outflow = {}  # (zone_id, side) -> total units drained this tick
+
+    for action in all_actions:
+        if action.action_type == ActionType.HOLD:
+            continue
+
+        # Snapshot zone state (read-only)
+        source_zone_snapshot = next(
+            (z for z in state.zones if z.zone_id == action.source_zone),
+            None,
+        )
+        target_zone_snapshot = next(
+            (z for z in state.zones if z.zone_id == action.target_zone),
+            None,
+        )
+        allowed_targets = ADJACENCY.get(action.source_zone, [])
+        if source_zone_snapshot is None or target_zone_snapshot is None:
+            actions_rejected[action.side] += 1
+            continue
+        if action.target_zone not in allowed_targets:
+            actions_rejected[action.side] += 1
+            continue
+
+        # Verify attacker has sufficient units in source zone (including cumulative outflow this tick)
+        source_key = (action.source_zone, action.side)
+        already_drained = cumulative_outflow.get(source_key, 0)
+
+        if action.side == Side.BLUE:
+            available_units = source_zone_snapshot.blue_units - already_drained
+            if available_units < action.units_to_move:
+                actions_rejected[action.side] += 1
+                continue
+        else:  # RED
+            available_units = source_zone_snapshot.red_units - already_drained
+            if available_units < action.units_to_move:
+                actions_rejected[action.side] += 1
+                continue
+
+        # Action passes validation — increment counter only now
+        actions_taken[action.side] += 1
+        cumulative_outflow[source_key] = already_drained + action.units_to_move
+
+        # Get attacker and defender units from snapshot
+        attacker_units = action.units_to_move
+        defender_units = (
+            target_zone_snapshot.red_units
+            if action.side == Side.BLUE
+            else target_zone_snapshot.blue_units
+        )
+
+        # Get attacker fuel
+        attacker_fuel = (
+            state.blue_fuel
+            if action.side == Side.BLUE
+            else state.red_fuel
+        )
+
+        # Compute attacker_controls_flank from actual adjacency/zone state
+        attacker_controls_flank = compute_attacker_controls_flank(
+            state, action.side, action.target_zone
+        )
+
+        # Compute attacker_controls_zone_3
+        attacker_controls_zone_3 = (
+            target_zone_snapshot.zone_id == 3
+            and (
+                (action.side == Side.BLUE and target_zone_snapshot.side_control == ZoneControl.BLUE)
+                or (action.side == Side.RED and target_zone_snapshot.side_control == ZoneControl.RED)
+            )
+        )
+
+        # Calculate attrition
+        attrition_result = calculate_attrition(
+            attacker_units=attacker_units,
+            defender_units=defender_units,
+            attacker_fuel=attacker_fuel,
+            attacker_controls_flank=attacker_controls_flank,
+            attacker_controls_zone_3=attacker_controls_zone_3,
+        )
+
+        # Classic wargame movement: units relocate from source to target
+        attacker_survivors = attacker_units - attrition_result.attacker_losses
+        opponent_side = Side.RED if action.side == Side.BLUE else Side.BLUE
+
+        # Delta 1: Remove units from source zone
+        pending_deltas.append(
+            Delta(
+                zone_id=action.source_zone,
+                side=action.side,
+                unit_delta=-attacker_units,
+                fuel_delta=-attrition_result.attacker_fuel_penalty,
+                weapons_delta=-attrition_result.attacker_weapons_consumed,
+            )
+        )
+
+        # Delta 2: Add surviving attacker units to target zone
+        pending_deltas.append(
+            Delta(
+                zone_id=action.target_zone,
+                side=action.side,
+                unit_delta=attacker_survivors,
+                fuel_delta=0,
+                weapons_delta=0,
+            )
+        )
+
+        # Delta 3: Apply defender losses to target zone
+        pending_deltas.append(
+            Delta(
+                zone_id=action.target_zone,
+                side=opponent_side,
+                unit_delta=-attrition_result.defender_losses,
+                fuel_delta=0,
+                weapons_delta=0,
+            )
+        )
+
+    return pending_deltas, actions_taken, actions_rejected
+
+================================================================================
 FILE: ./ares-sim/core/attrition.py
 ================================================================================
 
@@ -459,11 +865,97 @@ def calculate_attrition(
 
 
 ================================================================================
+FILE: ./ares-sim/core/intel.py
+================================================================================
+
+from config.settings import ADJACENCY
+from core.state import BattleState, Side, ZoneControl
+
+
+def get_visible_zones_for_side(state: BattleState, side: Side) -> set[int]:
+    """
+    Compute zones visible to a side based on control.
+    
+    A zone is visible if:
+    - The side controls it directly, OR
+    - The side controls an adjacent zone
+    
+    This represents scouting/intelligence presence.
+    """
+    visible = set()
+
+    for zone in state.zones:
+        # Check if we control this zone
+        if side == Side.BLUE and zone.side_control == ZoneControl.BLUE:
+            visible.add(zone.zone_id)
+        elif side == Side.RED and zone.side_control == ZoneControl.RED:
+            visible.add(zone.zone_id)
+        else:
+            # Check if we control an adjacent zone
+            adjacent_zone_ids = ADJACENCY.get(zone.zone_id, [])
+            for adj_id in adjacent_zone_ids:
+                adj_zone = next(
+                    (z for z in state.zones if z.zone_id == adj_id),
+                    None,
+                )
+                if adj_zone is None:
+                    continue
+
+                if side == Side.BLUE and adj_zone.side_control == ZoneControl.BLUE:
+                    visible.add(zone.zone_id)
+                    break
+                elif side == Side.RED and adj_zone.side_control == ZoneControl.RED:
+                    visible.add(zone.zone_id)
+                    break
+
+    return visible
+
+
+def update_enemy_memory(state: BattleState, enemy_memory: dict, side: Side) -> None:
+    """
+    Update memory for a side based on current visibility.
+    
+    If enemy is visible in any visible zone, update memory with the
+    closest enemy zone and unit count. If not visible, memory persists
+    (this is the decay mechanic: stale info remains until refreshed).
+    """
+    visible_zones = get_visible_zones_for_side(state, side)
+
+    closest_enemy_zone = None
+    enemy_units_in_closest = None
+    min_distance_to_ref = float("inf")
+    ref_zone = 2 if side == Side.BLUE else 4
+
+    for zone in state.zones:
+        if zone.zone_id not in visible_zones:
+            continue
+
+        enemy_count = (
+            zone.red_units if side == Side.BLUE else zone.blue_units
+        )
+
+        if enemy_count > 0:
+            distance = abs(zone.zone_id - ref_zone)
+            if distance < min_distance_to_ref:
+                min_distance_to_ref = distance
+                closest_enemy_zone = zone.zone_id
+                enemy_units_in_closest = enemy_count
+
+    # If enemy found in visible zones, update memory
+    if closest_enemy_zone is not None:
+        enemy_memory[side] = {
+            "zone": closest_enemy_zone,
+            "units": enemy_units_in_closest,
+            "tick_seen": state.current_tick,
+        }
+    # else: memory unchanged (stale sighting persists)
+
+================================================================================
 FILE: ./ares-sim/core/obs.py
 ================================================================================
 
 from typing import Mapping
-
+from config.settings import ADJACENCY
 from core.state import BattleState, CommanderObs, Side
 
 
@@ -504,6 +996,12 @@ def build_obs(
     else:
         how_many_ticks_ago_enemy_last_seen = None
 
+    legal_targets_per_zone = {
+            zone_id : ADJACENCY.get(zone_id,[])
+            for zone_id, count in own_units.items()
+            if count > 0
+            }
+
     return CommanderObs(
         side=side,
         current_tick=state.current_tick,
@@ -513,6 +1011,7 @@ def build_obs(
         enemy_last_known_unit_count=last_enemy_known_units,
         enemy_last_known_zone=last_enemy_known_zone,
         how_many_ticks_ago_enemy_last_seen=how_many_ticks_ago_enemy_last_seen,
+        legal_targets_per_zone=legal_targets_per_zone
     )
 
 
@@ -699,45 +1198,113 @@ class CommanderObs(BaseModel):
         description="Ticks elapsed since the last confirmed enemy sighting.",
     )
     model_config = ConfigDict(frozen=True)
+    
+    legal_targets_per_zone: dict[int, list[int]] = Field(
+    default_factory=dict,
+    description=(
+        "For each zone you currently occupy, the exact list of zone_ids "
+        "you are permitted to target with a move action. Use this directly "
+        "as the source of truth for adjacency — do not infer adjacency yourself."
+    ),
+)
 
 
 
+================================================================================
+FILE: ./ares-sim/core/state_updater.py
+================================================================================
+
+from core.state import BattleState, Side, ZoneControl
+from core.zones import determine_zone_control
+from core.action_resolver import Delta
+
+
+def apply_deltas(state: BattleState, deltas: list[Delta]) -> BattleState:
+    """Apply all pending deltas to state in one batch."""
+    if not deltas:
+        return state
+
+    # Group deltas by zone for efficient batch update
+    zone_updates = {}
+    blue_fuel_total = state.blue_fuel
+    red_fuel_total = state.red_fuel
+    blue_weapons_total = state.blue_weapons_remaining
+    red_weapons_total = state.red_weapons_remaining
+
+    for delta in deltas:
+        if delta.zone_id not in zone_updates:
+            zone_updates[delta.zone_id] = {Side.BLUE: 0, Side.RED: 0}
+        
+        zone_updates[delta.zone_id][delta.side] += delta.unit_delta
+
+        # Apply fuel deltas
+        if delta.side == Side.BLUE:
+            blue_fuel_total += delta.fuel_delta
+            blue_weapons_total += delta.weapons_delta
+        else:
+            red_fuel_total += delta.fuel_delta
+            red_weapons_total += delta.weapons_delta
+
+    # Rebuild zones with updated unit counts
+    updated_zones = []
+    for zone in state.zones:
+        if zone.zone_id in zone_updates:
+            blue_units = max(0, zone.blue_units + zone_updates[zone.zone_id][Side.BLUE])
+            red_units = max(0, zone.red_units + zone_updates[zone.zone_id][Side.RED])
+            
+            # Recalculate zone control based on updated units
+            new_control = determine_zone_control(red_units, blue_units)
+            
+            updated_zones.append(
+                zone.model_copy(
+                    update={
+                        "blue_units": blue_units,
+                        "red_units": red_units,
+                        "side_control": new_control,
+                    }
+                )
+            )
+        else:
+            updated_zones.append(zone)
+
+    # Return updated state with all deltas applied
+    return state.model_copy(
+        update={
+            "zones": updated_zones,
+            "blue_fuel": max(0, blue_fuel_total),
+            "red_fuel": max(0, red_fuel_total),
+            "blue_weapons_remaining": max(0, blue_weapons_total),
+            "red_weapons_remaining": max(0, red_weapons_total),
+        }
+    )
 
 ================================================================================
 FILE: ./ares-sim/core/tick.py
 ================================================================================
 
 import pathlib
-from core.state import BattleState, Side, ZoneControl
 import time
-from core.obs import build_obs
-from agents.models import ActionType, TickLogEntry
-from agents.Commander.BaseCommander import BaseCommander
-from core.attrition import calculate_attrition
-from core.zones import determine_zone_control, update_zone_3_ticks
-from core.outcomes import check_win_condition
-from config.settings import ADJACENCY
-from typing import NamedTuple
 import logging
 
-
+from core.state import BattleState, Side, ZoneControl
+from core.obs import build_obs
+from agents.models import ActionType  ,TickLogEntry
+from agents.Commander.BaseCommander import BaseCommander
+from core.outcomes import check_win_condition
+from core.zones import update_zone_3_ticks
+from core.intel import update_enemy_memory
+from core.action_resolver import resolve_actions
+from core.state_updater import apply_deltas
+from agents.models import FullTickSnapshot
 
 logger = logging.getLogger(__name__)
-
-
-class Delta(NamedTuple):
-    """Represents a unit/fuel change to apply to a zone."""
-    zone_id: int
-    side: Side
-    unit_delta: int
-    fuel_delta: int
-    weapons_delta: int
-
-REQUESTS_PER_MINUTE_LIMIT = 30
+TPM_LIMIT = 8000
 SAFETY_MARGIN = 0.8
-CALLS_PER_TICK = 2  # blue + red, ignoring retries
-SLEEP_SECONDS = (60 / (REQUESTS_PER_MINUTE_LIMIT * SAFETY_MARGIN)) * CALLS_PER_TICK
+TOKENS_PER_CALL = 2328 + 900  # input + conservative output ceiling at low effort ≈ 3228
+CALLS_PER_TICK = 2
 
+SLEEP_SECONDS = 60 * (TOKENS_PER_CALL * CALLS_PER_TICK) / (TPM_LIMIT * SAFETY_MARGIN)
+# = 60 * 6456 / 6400 ≈ 60.5s/tick
 class TickEngine:
     def __init__(
         self,
@@ -750,6 +1317,11 @@ class TickEngine:
         self.blue = blue_commander
         self.red = red_commander
         self.log_path = pathlib.Path(log_path) if log_path else None
+        if self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file_handle = self.log_path.open("w", encoding="utf-8")
+        else:
+            self.log_file_handle = None
         self.tick_log: list[TickLogEntry] = []
         # Enemy memory: {Side -> {zone, units, tick_seen}}
         # Persists across ticks; updated only when enemy visible in controlled zones
@@ -758,116 +1330,13 @@ class TickEngine:
             Side.RED: {"zone": None, "units": None, "tick_seen": None},
         }
 
-    def _get_visible_zones_for_side(self, side: Side) -> set[int]:
-        """Compute zones visible to a side based on control.
-        
-        A zone is visible if:
-        - The side controls it directly, OR
-        - The side controls an adjacent zone
-        
-        This represents scouting/intelligence presence.
-        """
-        visible = set()
-        
-        for zone in self.state.zones:
-            # Check if we control this zone
-            if side == Side.BLUE and zone.side_control == ZoneControl.BLUE:
-                visible.add(zone.zone_id)
-            elif side == Side.RED and zone.side_control == ZoneControl.RED:
-                visible.add(zone.zone_id)
-            else:
-                # Check if we control an adjacent zone
-                adjacent_zone_ids = ADJACENCY.get(zone.zone_id, [])
-                for adj_id in adjacent_zone_ids:
-                    adj_zone = next(
-                        (z for z in self.state.zones if z.zone_id == adj_id),
-                        None,
-                    )
-                    if adj_zone is None:
-                        continue
-                    
-                    if side == Side.BLUE and adj_zone.side_control == ZoneControl.BLUE:
-                        visible.add(zone.zone_id)
-                        break
-                    elif side == Side.RED and adj_zone.side_control == ZoneControl.RED:
-                        visible.add(zone.zone_id)
-                        break
-        
-        return visible
-    
-    def _update_enemy_memory(self, side: Side) -> None:
-        """Update memory for a side based on current visibility.
-        
-        If enemy is visible in any visible zone, update memory with the
-        closest enemy zone and unit count. If not visible, memory persists
-        (this is the decay mechanic: stale info remains until refreshed).
-        """
-        visible_zones = self._get_visible_zones_for_side(side)
-        
-        # Find enemy in any visible zone
-        # enemy_side = Side.RED if side == Side.BLUE else Side.BLUE
-        
-        closest_enemy_zone = None
-        enemy_units_in_closest = None
-        min_distance_to_ref = float("inf")
-        ref_zone = 2 if side == Side.BLUE else 4
-        
-        for zone in self.state.zones:
-            if zone.zone_id not in visible_zones:
-                continue
-            
-            enemy_count = (
-                zone.red_units if side == Side.BLUE else zone.blue_units
-            )
-            
-            if enemy_count > 0:
-                distance = abs(zone.zone_id - ref_zone)
-                if distance < min_distance_to_ref:
-                    min_distance_to_ref = distance
-                    closest_enemy_zone = zone.zone_id
-                    enemy_units_in_closest = enemy_count
-        
-        # If enemy found in visible zones, update memory
-        if closest_enemy_zone is not None:
-            self.enemy_memory[side] = {
-                "zone": closest_enemy_zone,
-                "units": enemy_units_in_closest,
-                "tick_seen": self.state.current_tick,
-            }
-        # else: memory unchanged (stale sighting persists)
-
-    def _compute_attacker_controls_flank(self, action_side: Side, target_zone_id: int) -> bool:
-        """
-        Determine if the attacker controls the flank by checking adjacent zones.
-        Attacker controls flank if they control adjacent zones.
-        """
-        adjacent_zone_ids = ADJACENCY.get(target_zone_id, [])
-        
-        for adj_zone_id in adjacent_zone_ids:
-            adj_zone = next(
-                (z for z in self.state.zones if z.zone_id == adj_zone_id),
-                None,
-            )
-            if adj_zone is None:
-                continue
-            
-            # Check if attacker controls this adjacent zone
-            if action_side == Side.BLUE:
-                if adj_zone.side_control == ZoneControl.BLUE:
-                    return True
-            else:  # RED
-                if adj_zone.side_control == ZoneControl.RED:
-                    return True
-        
-        return False
-
     def run(self, max_ticks: int) -> BattleState:
         from agents.models import CommanderMemory
 
         # Initialize/truncate the log file if a path is provided
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.log_path.open("w", encoding="utf-8").close()
+            
 
         # Seed initial memory for each side — commanders update and return
         # new memory each tick; we thread it forward.
@@ -884,43 +1353,39 @@ class TickEngine:
 
         while self.state.is_engagement_active and self.state.current_tick < max_ticks:
             # Update enemy memory for both sides based on current zone control
-            self._update_enemy_memory(Side.BLUE)
-            self._update_enemy_memory(Side.RED)
+            update_enemy_memory(self.state, self.enemy_memory, Side.BLUE)
+            update_enemy_memory(self.state, self.enemy_memory, Side.RED)
 
             # Collect decisions from both sides (obs + memory in, decision + new memory out)
             blue_obs = build_obs(self.state, Side.BLUE, self.enemy_memory[Side.BLUE])
             red_obs = build_obs(self.state, Side.RED, self.enemy_memory[Side.RED])
+            if self.state.current_tick % 2 == 0:
+                turn_order = [
+                    (Side.BLUE, self.blue, blue_obs),
+                    (Side.RED, self.red, red_obs),
+                ]
+            else:
+                turn_order = [
+                    (Side.RED, self.red, red_obs),
+                    (Side.BLUE, self.blue, blue_obs),
+                ]
 
-            blue_decision = self.blue.decide(blue_obs, blue_memory)
-            blue_outcome = self.blue.last_call_outcome
-            red_decision = self.red.decide(red_obs, red_memory)
-            red_outcome = self.red.last_call_outcome
+            results = {}
+            for side, commander, obs in turn_order:
+                mem = blue_memory if side == Side.BLUE else red_memory
+                results[side] = (commander.decide(obs, mem), commander.last_call_outcome)
+                time.sleep(5)  # small gap between same-tick calls
 
+            blue_decision, blue_outcome = results[Side.BLUE]
+            red_decision, red_outcome = results[Side.RED]
             # Thread updated memory forward to the next tick
             blue_memory = blue_decision.memory
             red_memory = red_decision.memory
-            
 
             time.sleep(SLEEP_SECONDS)
 
             # Build log entries for this tick (before actions are resolved)
-            for side, decision, outcome in [
-                (Side.BLUE, blue_decision, blue_outcome),
-                (Side.RED,  red_decision,  red_outcome),
-            ]:
-                entry = TickLogEntry(
-                    tick=self.state.current_tick,
-                    side=side,
-                    call_outcome=outcome,
-                    actions=decision.actions,
-                    current_objective=decision.memory.current_objective,
-                    last_action_summary=decision.memory.last_action_summary,
-                    tick_of_last_strategy_changed=decision.memory.tick_of_last_strategy_changed,
-                )
-                self.tick_log.append(entry)
-                if self.log_path:
-                    with self.log_path.open("a", encoding="utf-8") as fh:
-                        fh.write(entry.model_dump_json() + "\n")
+            
 
             # BUG FIX: .actions on a CommanderDecision is an Actions model;
             # .actions.actions is the underlying list[CommanderAction].
@@ -928,139 +1393,25 @@ class TickEngine:
                 blue_decision.actions.actions + red_decision.actions.actions
             )
 
-            pending_deltas = []
-            actions_taken_per_side = {Side.BLUE: 0, Side.RED: 0}
-            actions_rejected_per_side = {Side.BLUE: 0, Side.RED: 0}
-            cumulative_outflow = {}  # Track (zone_id, side) -> total units drained this tick
+            # Resolve all actions and collect deltas (no state mutation yet)
+            pending_deltas, actions_taken, actions_rejected = resolve_actions(
+                self.state, all_actions
+            )
 
-            # Process all actions without mutating state
-            for action in all_actions:
-                if action.action_type == ActionType.HOLD:
-                    continue
-
-                # Snapshot zone state (read-only)
-                source_zone_snapshot = next(
-                    (z for z in self.state.zones if z.zone_id == action.source_zone),
-                    None,
-                )
-                target_zone_snapshot = next(
-                    (z for z in self.state.zones if z.zone_id == action.target_zone),
-                    None,
-                )
-                allowed_targets = ADJACENCY.get(action.source_zone,[])
-                if source_zone_snapshot is None or target_zone_snapshot is None:
-                    actions_rejected_per_side[action.side] += 1
-                    continue
-                if action.target_zone not in allowed_targets:
-                    actions_rejected_per_side[action.side] += 1
-                    continue
-
-                # Verify attacker has sufficient units in source zone (including cumulative outflow this tick)
-                source_key = (action.source_zone, action.side)
-                already_drained = cumulative_outflow.get(source_key, 0)
-                
-                if action.side == Side.BLUE:
-                    available_units = source_zone_snapshot.blue_units - already_drained
-                    if available_units < action.units_to_move:
-                        actions_rejected_per_side[action.side] += 1
-                        continue
-                else:  # RED
-                    available_units = source_zone_snapshot.red_units - already_drained
-                    if available_units < action.units_to_move:
-                        actions_rejected_per_side[action.side] += 1
-                        continue
-
-                # Action passes validation — increment counter only now
-                actions_taken_per_side[action.side] += 1
-                cumulative_outflow[source_key] = already_drained + action.units_to_move
-
-                # Get attacker and defender units from snapshot
-                attacker_units = action.units_to_move
-                defender_units = (
-                    target_zone_snapshot.red_units
-                    if action.side == Side.BLUE
-                    else target_zone_snapshot.blue_units
-                )
-                
-                # Get attacker fuel
-                attacker_fuel = (
-                    self.state.blue_fuel
-                    if action.side == Side.BLUE
-                    else self.state.red_fuel
-                )
-
-                # Compute attacker_controls_flank from actual adjacency/zone state
-                attacker_controls_flank = self._compute_attacker_controls_flank(
-                    action.side, action.target_zone
-                )
-
-                # Compute attacker_controls_zone_3
-                attacker_controls_zone_3 = (
-                    target_zone_snapshot.zone_id == 3
-                    and (
-                        (action.side == Side.BLUE and target_zone_snapshot.side_control == ZoneControl.BLUE)
-                        or (action.side == Side.RED and target_zone_snapshot.side_control == ZoneControl.RED)
-                    )
-                )
-
-                # Calculate attrition
-                attrition_result = calculate_attrition(
-                    attacker_units=attacker_units,
-                    defender_units=defender_units,
-                    attacker_fuel=attacker_fuel,
-                    attacker_controls_flank=attacker_controls_flank,
-                    attacker_controls_zone_3=attacker_controls_zone_3,
-                )
-
-                # Classic wargame movement: units relocate from source to target
-                attacker_survivors = attacker_units - attrition_result.attacker_losses
-                opponent_side = Side.RED if action.side == Side.BLUE else Side.BLUE
-
-                # Delta 1: Remove units from source zone
-                pending_deltas.append(
-                    Delta(
-                        zone_id=action.source_zone,
-                        side=action.side,
-                        unit_delta=-attacker_units,
-                        fuel_delta=-attrition_result.attacker_fuel_penalty,
-                        weapons_delta=-attrition_result.attacker_weapons_consumed,
-                    )
-                )
-
-                # Delta 2: Add surviving attacker units to target zone
-                pending_deltas.append(
-                    Delta(
-                        zone_id=action.target_zone,
-                        side=action.side,
-                        unit_delta=attacker_survivors,
-                        fuel_delta=0,
-                        weapons_delta=0,
-                    )
-                )
-
-                # Delta 3: Apply defender losses to target zone
-                pending_deltas.append(
-                    Delta(
-                        zone_id=action.target_zone,
-                        side=opponent_side,
-                        unit_delta=-attrition_result.defender_losses,
-                        fuel_delta=0,
-                        weapons_delta=0,
-                    )
-                )
-
-            # Apply all pending_deltas in batch (simultaneous resolution)
+            # Save previous zone 3 control before applying deltas
             prev_zone_3_control = next(
                 (z.side_control for z in self.state.zones if z.zone_id == 3),
                 None,
             )
-            self.state = self._apply_deltas(pending_deltas)
+
+            # Apply all deltas in one batch
+            self.state = apply_deltas(self.state, pending_deltas)
 
             # Log tick result
             logger.info(
                 f"Tick {self.state.current_tick}: "
-                f"Blue actions executed={actions_taken_per_side[Side.BLUE]}, rejected={actions_rejected_per_side[Side.BLUE]}, "
-                f"Red actions executed={actions_taken_per_side[Side.RED]}, rejected={actions_rejected_per_side[Side.RED]}, "
+                f"Blue actions executed={actions_taken[Side.BLUE]}, rejected={actions_rejected[Side.BLUE]}, "
+                f"Red actions executed={actions_taken[Side.RED]}, rejected={actions_rejected[Side.RED]}, "
                 f"Deltas applied={len(pending_deltas)}, "
                 f"Zone control: {[(z.zone_id, z.side_control) for z in self.state.zones]}"
             )
@@ -1079,78 +1430,51 @@ class TickEngine:
             
             # Check win condition
             self.state = check_win_condition(state=self.state)
+
+
+            if self.log_file_handle:
+                snapshot = FullTickSnapshot(
+                    tick=self.state.current_tick,
+                    is_engagement_active=self.state.is_engagement_active,
+                    battle_winner=self.state.battle_winner,
+                    zones=self.state.zones, # Ground truth
+                    red_fuel=self.state.red_fuel,
+                    blue_fuel=self.state.blue_fuel,
+                    red_weapons_remaining=self.state.red_weapons_remaining,
+                    blue_weapons_remaining=self.state.blue_weapons_remaining,
+                    zone_3_consecutive_ticks=self.state.zone_3_consecutive_ticks,
+                    blue_observation=blue_obs,  # What Blue saw
+                    red_observation=red_obs,    # What Red saw
+                    blue_decision=blue_decision, # What Blue ordered
+                    red_decision=red_decision,   # What Red ordered
+                    blue_actions_taken=actions_taken[Side.BLUE],
+                    blue_actions_rejected=actions_rejected[Side.BLUE],
+                    red_actions_taken=actions_taken[Side.RED],
+                    red_actions_rejected=actions_rejected[Side.RED],
+                    total_deltas_applied=len(pending_deltas),
+                )
+                # Write as a single JSON line
+                self.log_file_handle.write(snapshot.model_dump_json() + "\n")
+                self.log_file_handle.flush()  # Ensure it's written to disk immediately
+
+            # Human-readable console logging (very useful for watching it live)
+            logger.info(
+                f"Tick {self.state.current_tick}: "
+                f"Blue: {actions_taken[Side.BLUE]} taken, {actions_rejected[Side.BLUE]} rej | "
+                f"Red: {actions_taken[Side.RED]} taken, {actions_rejected[Side.RED]} rej | "
+                f"Z3 Control: {zone_3.side_control if zone_3 else 'N/A'} ({self.state.zone_3_consecutive_ticks})"
+            )
+
             
             # Advance tick
             self.state = self.state.model_copy(
                 update={"current_tick": self.state.current_tick + 1}
             )
 
+        if self.log_file_handle:
+            self.log_file_handle.close()
+
         return self.state
-
-    def _apply_deltas(self, deltas: list[Delta]) -> BattleState:
-        """Apply all pending deltas to state in one batch."""
-        if not deltas:
-            return self.state
-
-        # Group deltas by zone for efficient batch update
-        zone_updates = {}
-        blue_fuel_total = self.state.blue_fuel
-        red_fuel_total = self.state.red_fuel
-        blue_weapons_total = self.state.blue_weapons_remaining
-        red_weapons_total = self.state.red_weapons_remaining
-
-        for delta in deltas:
-            if delta.zone_id not in zone_updates:
-                zone_updates[delta.zone_id] = {Side.BLUE: 0, Side.RED: 0}
-            
-            zone_updates[delta.zone_id][delta.side] += delta.unit_delta
-
-            # Apply fuel deltas
-            if delta.side == Side.BLUE:
-                blue_fuel_total += delta.fuel_delta
-                blue_weapons_total += delta.weapons_delta
-            else:
-                red_fuel_total += delta.fuel_delta
-                red_weapons_total += delta.weapons_delta
-
-        # Rebuild zones with updated unit counts
-        updated_zones = []
-        for zone in self.state.zones:
-            if zone.zone_id in zone_updates:
-                blue_units = max(0, zone.blue_units + zone_updates[zone.zone_id][Side.BLUE])
-                red_units = max(0, zone.red_units + zone_updates[zone.zone_id][Side.RED])
-                
-                # Recalculate zone control based on updated units
-                new_control = determine_zone_control(red_units, blue_units)
-                
-                updated_zones.append(
-                    zone.model_copy(
-                        update={
-                            "blue_units": blue_units,
-                            "red_units": red_units,
-                            "side_control": new_control,
-                        }
-                    )
-                )
-            else:
-                updated_zones.append(zone)
-
-        # Return updated state with all deltas applied
-        return self.state.model_copy(
-            update={
-                "zones": updated_zones,
-                "blue_fuel": max(0, blue_fuel_total),
-                "red_fuel": max(0, red_fuel_total),
-                "blue_weapons_remaining": max(0, blue_weapons_total),
-                "red_weapons_remaining": max(0, red_weapons_total),
-            }
-        )
-
-
-
-
-
-# TODO: make thse into smaller
 
 
 ================================================================================
