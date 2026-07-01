@@ -1,4 +1,4 @@
-from core.state import Side
+from core.state import Side, ZoneControl
 def compute_reward(prev_state, post_state):
     """
     prev_state, post_state: BattleState snapshots, before/after this tick's deltas
@@ -14,10 +14,19 @@ def compute_reward(prev_state, post_state):
     prev_streak = prev_state.zone_3_consecutive_ticks
     post_streak = post_state.zone_3_consecutive_ticks
 
-    # Streak progression / break logic
+    prev_zone_3 = next((z for z in prev_state.zones if z.zone_id == 3), None)
+    post_zone_3 = next((z for z in post_state.zones if z.zone_id == 3), None)
+
+    # Streak progression / break logic (Blue's perspective)
     if post_streak > prev_streak:
-        reward += 1.0
+        if post_zone_3 and post_zone_3.side_control == ZoneControl.BLUE:
+            reward += 1.0
+        elif post_zone_3 and post_zone_3.side_control == ZoneControl.RED:
+            reward -= 1.0
     elif post_streak < prev_streak:
-        reward -= float(prev_streak)
+        if prev_zone_3 and prev_zone_3.side_control == ZoneControl.BLUE:
+            reward -= float(prev_streak)
+        elif prev_zone_3 and prev_zone_3.side_control == ZoneControl.RED:
+            reward += float(prev_streak)
 
     return reward

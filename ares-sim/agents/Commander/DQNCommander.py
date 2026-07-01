@@ -4,24 +4,33 @@ from agents.Commander.BaseCommander import BaseCommander
 from agents.RL.DQN.encoder import ObservationEncoder
 from agents.RL.DQN.network import DQNNetwork
 from agents.RL.DQN.epsilon import EpsilonScheduler
-from agents.RL.DQN.replay_buffer import ReplayBuffer
+
 from agents.models import ActionType, Actions, CommanderAction, CommanderDecision, CommanderMemory
 from core.state import CommanderObs
-from agents.RL.DQN.trainer import Trainer
+
 
 class DQNCommander(BaseCommander):
-    def __init__(self, state_dim: int, hidden_dim: int = 128,
-                 epsilon_start: float = 1.0, epsilon_end: float = 0.05,
-                 epsilon_decay_steps: int = 10_000, trainer = None):
+    """Pure policy commander: receives observation, returns decision.
+
+    Owns no replay buffer, trainer, or optimizer.
+    The network, encoder, and epsilon scheduler are injected from outside.
+    """
+
+    def __init__(
+        self,
+        network: DQNNetwork,
+        encoder: ObservationEncoder,
+        epsilon_scheduler: EpsilonScheduler,
+    ):
         super().__init__()
-        self.network = DQNNetwork(state_dim, hidden_dim)
-        self.encoder = ObservationEncoder()
-        self.epsilon_scheduler = EpsilonScheduler(epsilon_start, epsilon_end, epsilon_decay_steps)
+        self.network = network
+        self.encoder = encoder
+        self.epsilon_scheduler = epsilon_scheduler
         self.tick_counter = 0   # used to compute epsilon — increments once per decide() call
         self.side = None
-        self.last_action_indices = {}
-        self.replay_buffer = ReplayBuffer(capacity=1000)
-        self.trainer = Trainer
+        self.last_action_indices: dict[int, int] = {}
+        self.last_q_values: dict[str, list[float]] = {}
+
     def _get_action_for_zone(self, zone_id, unit_count, legal_targets, q_values_for_zone, epsilon):
         if random.random() < epsilon:
             choices = ["hold"] + legal_targets
@@ -51,12 +60,15 @@ class DQNCommander(BaseCommander):
             action_type=ActionType.HOLD if action_type == "hold" else ActionType.MOVE,
     )
 
-
     def decide(self, obs: CommanderObs, memory):
         self.side = obs.side
         encoded = self.encoder.encode(obs)
         with torch.no_grad():
             q_values = self.network(encoded)   # dict: zone_1..zone_5
+            # Store raw Q-values for trace/eval purposes (convert to float lists)
+            self.last_q_values = {
+                k: v.squeeze(0).tolist() for k, v in q_values.items()
+            }
 
         epsilon = self.epsilon_scheduler.get_epsilon(self.tick_counter)
         self.tick_counter += 1
@@ -80,21 +92,6 @@ class DQNCommander(BaseCommander):
 
         return CommanderDecision(actions=Actions(actions=actions), memory=memory_out)
 
-    def train_step(self):
-        """
-    Triggers optimization step only if replay buffer contains enough data.
-    """
-        if self.trainer is not None and len(self.replay_buffer) >= self.trainer.batch_size:
-            return self.trainer.train_step() 
-        return None
-    def remember(self,obs, action_indices, reward, next_obs, done):
-        self.replay_buffer.push(
-            obs=obs,
-            action=action_indices,
-            reward=reward, 
-            next_obs=next_obs, 
-            done=done)
-        
     def save(self, path: str):
         """Saves weights to disk."""
         torch.save(self.network.state_dict(), path)

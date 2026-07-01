@@ -22,6 +22,7 @@ class DQNNetwork(nn.Module):
         for zone_id in range(1, self.num_zones + 1):
             out_size = 1 + len(ADJACENCY[zone_id])
             self.zone_heads[f"zone_{zone_id}"] = nn.Linear(hidden_dim, out_size)
+            
 
     def forward(self, state: torch.Tensor):
         """
