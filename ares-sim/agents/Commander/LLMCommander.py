@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from typing import cast
+from datetime import datetime
 import time
 import os
 
@@ -32,9 +33,64 @@ litellm.enable_json_schema_validation = True
 
 
 class LLMCommander(BaseCommander):
+    _last_request_time: float | None = None
+    _request_timestamps: list[float] = []
+    _daily_count_date: str | None = None
+    _daily_count: int = 0
+    _max_requests_per_minute = 2
+    _min_request_interval_seconds = 30.0
+    _daily_request_limit = 1000
+
     def __init__(self, model: str):
         super().__init__()
         self.model = model
+
+    @classmethod
+    def _reset_daily_count_if_needed(cls) -> None:
+        today = datetime.utcnow().date().isoformat()
+        if cls._daily_count_date != today:
+            cls._daily_count_date = today
+            cls._daily_count = 0
+            cls._request_timestamps = []
+            cls._last_request_time = None
+
+    @classmethod
+    def _wait_for_request_slot(cls) -> None:
+        cls._reset_daily_count_if_needed()
+        now = time.monotonic()
+        cls._request_timestamps = [
+            t for t in cls._request_timestamps if now - t < 60
+        ]
+
+        if cls._daily_count >= cls._daily_request_limit:
+            raise RuntimeError(
+                f"Daily LLM request limit reached ({cls._daily_request_limit})."
+            )
+
+        if len(cls._request_timestamps) >= cls._max_requests_per_minute:
+            oldest = cls._request_timestamps[0]
+            wait_seconds = 60 - (now - oldest) + 0.1
+            time.sleep(wait_seconds)
+            now = time.monotonic()
+            cls._request_timestamps = [
+                t for t in cls._request_timestamps if now - t < 60
+            ]
+
+        if cls._last_request_time is not None:
+            elapsed = now - cls._last_request_time
+            if elapsed < cls._min_request_interval_seconds:
+                time.sleep(cls._min_request_interval_seconds - elapsed)
+
+    @classmethod
+    def _record_request(cls) -> None:
+        cls._reset_daily_count_if_needed()
+        now = time.monotonic()
+        cls._request_timestamps.append(now)
+        cls._daily_count += 1
+        cls._last_request_time = now
+        cls._request_timestamps = [
+            t for t in cls._request_timestamps if now - t < 60
+        ]
 
     def _hold_decision(
         self,
@@ -128,6 +184,8 @@ class LLMCommander(BaseCommander):
         ]
 
         try:
+            self.__class__._wait_for_request_slot()
+            self.__class__._record_request()
             response = cast(
                 ModelResponse,
                 completion(
@@ -137,7 +195,7 @@ class LLMCommander(BaseCommander):
                     stream=False,
                     max_retries=0,
                     reasoning_effort="low",
-                    max_tokens=1600
+                    max_tokens=600
                 ),
             )
             decision = self._parse_response(response)
@@ -147,7 +205,7 @@ class LLMCommander(BaseCommander):
             print(f"Error type: {type(e).__name__}")
             print(f"Error message: {e}")
             self.last_error = f"{type(e).__name__}: {e}"
-            time.sleep(5)  
+            time.sleep(5)
         retry_messages = messages + [
             {
                 "role": "user",
@@ -159,6 +217,8 @@ class LLMCommander(BaseCommander):
         ]
 
         try:
+            self.__class__._wait_for_request_slot()
+            self.__class__._record_request()
             response = cast(
                 ModelResponse,
                 completion(
@@ -167,7 +227,7 @@ class LLMCommander(BaseCommander):
                     response_format={"type": "json_object"},
                     stream=False,
                     max_retries=0,
-                    max_tokens=1600,
+                    max_tokens=600,
                     reasoning_effort="low"
                 ),
             )

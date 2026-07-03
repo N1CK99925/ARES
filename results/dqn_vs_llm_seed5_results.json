@@ -1,0 +1,139 @@
+{
+  "created_at": "2026-07-03T19:55:18.962869Z",
+  "seed": "seed_5",
+  "checkpoints": [
+    {
+      "checkpoint": "checkpoint_dqn_ep_1.pt",
+      "exists": true,
+      "episodes": 1,
+      "wins": 0,
+      "games": 1,
+      "win_rate": 0.0,
+      "win_rate_ci": [
+        0,
+        0.7934567085261071
+      ],
+      "blue_wins": 0,
+      "blue_games": 1,
+      "red_wins": 0,
+      "red_games": 0,
+      "win_types": {
+        "zone3_hold": 1
+      }
+    },
+    {
+      "checkpoint": "checkpoint_dqn_ep_100.pt",
+      "exists": true,
+      "episodes": 1,
+      "wins": 0,
+      "games": 1,
+      "win_rate": 0.0,
+      "win_rate_ci": [
+        0,
+        0.7934567085261071
+      ],
+      "blue_wins": 0,
+      "blue_games": 1,
+      "red_wins": 0,
+      "red_games": 0,
+      "win_types": {
+        "timeout": 1
+      }
+    },
+    {
+      "checkpoint": "checkpoint_dqn_ep_200.pt",
+      "exists": true,
+      "episodes": 1,
+      "wins": 1,
+      "games": 1,
+      "win_rate": 1.0,
+      "win_rate_ci": [
+        0.20654329147389294,
+        1
+      ],
+      "blue_wins": 1,
+      "blue_games": 1,
+      "red_wins": 0,
+      "red_games": 0,
+      "win_types": {
+        "zone3_hold": 1
+      }
+    },
+    {
+      "checkpoint": "checkpoint_dqn_ep_500.pt",
+      "exists": true,
+      "episodes": 1,
+      "wins": 0,
+      "games": 1,
+      "win_rate": 0.0,
+      "win_rate_ci": [
+        0,
+        0.7934567085261071
+      ],
+      "blue_wins": 0,
+      "blue_games": 1,
+      "red_wins": 0,
+      "red_games": 0,
+      "win_types": {
+        "zone3_hold": 1
+      }
+    },
+    {
+      "checkpoint": "checkpoint_dqn_ep_1000.pt",
+      "exists": true,
+      "episodes": 1,
+      "wins": 0,
+      "games": 1,
+      "win_rate": 0.0,
+      "win_rate_ci": [
+        0,
+        0.7934567085261071
+      ],
+      "blue_wins": 0,
+      "blue_games": 1,
+      "red_wins": 0,
+      "red_games": 0,
+      "win_types": {
+        "zone3_hold": 1
+      }
+    },
+    {
+      "checkpoint": "checkpoint_dqn_ep_1500.pt",
+      "exists": true,
+      "episodes": 1,
+      "wins": 0,
+      "games": 1,
+      "win_rate": 0.0,
+      "win_rate_ci": [
+        0,
+        0.7934567085261071
+      ],
+      "blue_wins": 0,
+      "blue_games": 1,
+      "red_wins": 0,
+      "red_games": 0,
+      "win_types": {
+        "zone3_hold": 1
+      }
+    },
+    {
+      "checkpoint": "checkpoint_dqn_ep_2000.pt",
+      "exists": true,
+      "episodes": 1,
+      "wins": 0,
+      "games": 1,
+      "win_rate": 0.0,
+      "win_rate_ci": [
+        0,
+        0.7934567085261071
+      ],
+      "blue_wins": 0,
+      "blue_games": 1,
+      "red_wins": 0,
+      "red_games": 0,
+      "win_types": {
+        "zone3_hold": 1
+      }
+    }
+  ]
+}

@@ -123,3 +123,28 @@ def get_seed_4():
         battle_winner=None,
         zone_3_consecutive_ticks=0
     )
+
+
+def get_seed_5():
+    """
+    Case 5: Mixed pressure with contested center and uneven flanks.
+    Tests the agent against an LLM commander in a more balanced, dynamic battle.
+    """
+    zones = [
+        ZoneSnapshot(zone_id=1, red_units=20, blue_units=80, side_control=ZoneControl.BLUE),
+        ZoneSnapshot(zone_id=2, red_units=10, blue_units=40, side_control=ZoneControl.BLUE),
+        ZoneSnapshot(zone_id=3, red_units=30, blue_units=30, side_control=ZoneControl.NEUTRAL),
+        ZoneSnapshot(zone_id=4, red_units=70, blue_units=10, side_control=ZoneControl.RED),
+        ZoneSnapshot(zone_id=5, red_units=90, blue_units=5, side_control=ZoneControl.RED),
+    ]
+    return BattleState(
+        current_tick=0,
+        zones=zones,
+        red_fuel=170,
+        blue_fuel=130,
+        red_weapons_remaining=170,
+        blue_weapons_remaining=130,
+        is_engagement_active=True,
+        battle_winner=None,
+        zone_3_consecutive_ticks=0,
+    )

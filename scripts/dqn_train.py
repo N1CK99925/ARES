@@ -16,7 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "ares-sim"))
 import torch
 import torch.optim as optim
 
-from config.seeds import get_seed_1
+from config.seeds import get_seed_1, get_seed_2, get_seed_3, get_seed_4
 from core.tick import TickEngine
 from agents.Commander.DQNCommander import DQNCommander
 from agents.RL.DQN.network import DQNNetwork
@@ -24,7 +24,7 @@ from agents.RL.DQN.encoder import ObservationEncoder
 from agents.RL.DQN.epsilon import EpsilonScheduler
 from agents.RL.DQN.replay_buffer import ReplayBuffer
 from agents.RL.DQN.trainer import Trainer
-
+import random
 NUM_ZONES = 5
 
 
@@ -47,9 +47,8 @@ def run_training(resume_from: str | None = None):
     batch_size = 32
     gamma = 0.99
     lr = 1e-3
-    episodes = 1000
+    episodes = 2000
     max_ticks_per_episode = 1000
-    checkpoint_interval = 50
     replay_capacity = 50_000
     sync_every_k_steps = 100
     max_grad_norm = 10.0
@@ -100,10 +99,11 @@ def run_training(resume_from: str | None = None):
         # Epsilon already at floor after prior training; keep exploration minimal.
         blue_agent.tick_counter = epsilon_decay_steps
         red_agent.tick_counter = epsilon_decay_steps
-
-    # ── 5. Training loop ────────────────────────────────────────────────
+    
+    seeds = [get_seed_1(), get_seed_2(), get_seed_3(), get_seed_4()]
     for episode in range(start_episode, episodes + 1):
-        initial_state = get_seed_1()
+        seed_fn = random.choice(seeds)
+        initial_state = seed_fn
         engine = TickEngine(initial_state, blue_commander=blue_agent, red_commander=red_agent)
 
         ticks_this_episode = 0
@@ -172,7 +172,7 @@ def run_training(resume_from: str | None = None):
             )
 
         # ── Periodic checkpoint ─────────────────────────────────────────
-        if episode % checkpoint_interval == 0:
+        if episode in {1500, 2000}:
             ckpt_path = f"checkpoint_dqn_ep_{episode}.pt"
             blue_agent.save(ckpt_path)
             print(f"  -> Saved checkpoint: {ckpt_path}")
