@@ -1,0 +1,3532 @@
+
+================================================================================
+FILE: ./ares-sim/agents/Commander/BaseCommander.py
+================================================================================
+
+from abc import ABC
+from abc import abstractmethod
+from typing import Any
+from core.state import CommanderObs
+from agents.models import CommanderDecision, CallOutcome
+
+class BaseCommander(ABC):
+
+    def __init__(self) -> None:
+        
+        self.last_call_outcome: CallOutcome = "success"
+        self.last_error : str | None= None
+
+    @abstractmethod
+    def decide(self, obs: CommanderObs, memory: Any) -> CommanderDecision:
+        pass
+
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/Commander/DQNCommander.py
+================================================================================
+
+import random
+import torch
+from agents.Commander.BaseCommander import BaseCommander
+from agents.RL.DQN.encoder import ObservationEncoder
+from agents.RL.DQN.network import DQNNetwork
+from agents.RL.DQN.epsilon import EpsilonScheduler
+
+from agents.models import ActionType, Actions, CommanderAction, CommanderDecision, CommanderMemory
+from core.state import CommanderObs
+
+
+class DQNCommander(BaseCommander):
+    """Pure policy commander: receives observation, returns decision.
+
+    Owns no replay buffer, trainer, or optimizer.
+    The network, encoder, and epsilon scheduler are injected from outside.
+    """
+
+    def __init__(
+        self,
+        network: DQNNetwork,
+        encoder: ObservationEncoder,
+        epsilon_scheduler: EpsilonScheduler,
+    ):
+        super().__init__()
+        self.network = network
+        self.encoder = encoder
+        self.epsilon_scheduler = epsilon_scheduler
+        self.tick_counter = 0   # used to compute epsilon — increments once per decide() call
+        self.side = None
+        self.last_action_indices: dict[int, int] = {}
+        self.last_q_values: dict[str, list[float]] = {}
+
+    def _get_action_for_zone(self, zone_id, unit_count, legal_targets, q_values_for_zone, epsilon):
+        if random.random() < epsilon:
+            choices = ["hold"] + legal_targets
+            choice = random.choice(choices)
+            action_idx = choices.index(choice)
+            if choice == "hold":
+                action_type = "hold"
+                target_zone = zone_id
+            else:
+                action_type = "move"
+                target_zone = choice
+        else:
+            action_type, target_zone = self.network.get_action_for_zone(
+                zone_id, q_values_for_zone, unit_count
+            )
+            if action_type == "hold":
+                action_idx = 0
+            else:
+                action_idx = self.network.adjacency[zone_id].index(target_zone) + 1
+
+        units_to_move = unit_count if action_type == "move" else 0
+        return action_idx, CommanderAction(
+            side=self.side,
+            source_zone=zone_id,
+            target_zone=target_zone,
+            units_to_move=units_to_move,
+            action_type=ActionType.HOLD if action_type == "hold" else ActionType.MOVE,
+    )
+
+    def decide(self, obs: CommanderObs, memory):
+        self.side = obs.side
+        encoded = self.encoder.encode(obs)
+        with torch.no_grad():
+            q_values = self.network(encoded)   # dict: zone_1..zone_5
+            # Store raw Q-values for trace/eval purposes (convert to float lists)
+            self.last_q_values = {
+                k: v.squeeze(0).tolist() for k, v in q_values.items()
+            }
+
+        epsilon = self.epsilon_scheduler.get_epsilon(self.tick_counter)
+        self.tick_counter += 1
+
+        actions = []
+        action_indices = {}
+        for zone_id, unit_count in obs.own_unit_per_zone.items():
+            if unit_count <= 0:
+                continue
+            legal_targets = obs.legal_targets_per_zone.get(zone_id, [])
+            q_values_for_zone = q_values[f"zone_{zone_id}"]
+            idx, action = self._get_action_for_zone(zone_id, unit_count, legal_targets, q_values_for_zone, epsilon)
+            actions.append(action)
+            action_indices[zone_id] = idx
+        self.last_action_indices = action_indices
+        memory_out = CommanderMemory(
+            current_objective=memory.current_objective,
+            last_action_summary=str(actions),
+            tick_of_last_strategy_changed=memory.tick_of_last_strategy_changed
+)
+
+        return CommanderDecision(actions=Actions(actions=actions), memory=memory_out)
+
+    def save(self, path: str):
+        """Saves weights to disk."""
+        torch.save(self.network.state_dict(), path)
+
+    def load(self, path: str):
+        """Loads weights from disk."""
+        self.network.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
+        self.network.eval()  
+
+
+================================================================================
+FILE: ./ares-sim/agents/Commander/LLMCommander.py
+================================================================================
+
+import json
+from pathlib import Path
+from typing import cast
+from datetime import datetime
+import time
+import os
+
+
+import litellm
+
+os.environ["LITELLM_LOG"] = "INFO"
+
+from litellm import completion
+from litellm.types.utils import ModelResponse
+
+from core.state import CommanderObs
+from agents.models import (
+    Actions,
+    ActionType,
+    CommanderAction,
+    CommanderDecision,
+    CommanderMemory,
+)
+from agents.Commander.BaseCommander import BaseCommander
+
+
+CommanderPrompt = (
+    Path(__file__).parent.parent.parent / "prompts" / "commander_prompt.md"
+).read_text()
+
+
+litellm.enable_json_schema_validation = True
+
+
+class LLMCommander(BaseCommander):
+    _last_request_time: float | None = None
+    _request_timestamps: list[float] = []
+    _daily_count_date: str | None = None
+    _daily_count: int = 0
+    _max_requests_per_minute = 2
+    _min_request_interval_seconds = 30.0
+    _daily_request_limit = 1000
+
+    def __init__(self, model: str):
+        super().__init__()
+        self.model = model
+
+    @classmethod
+    def _reset_daily_count_if_needed(cls) -> None:
+        today = datetime.utcnow().date().isoformat()
+        if cls._daily_count_date != today:
+            cls._daily_count_date = today
+            cls._daily_count = 0
+            cls._request_timestamps = []
+            cls._last_request_time = None
+
+    @classmethod
+    def _wait_for_request_slot(cls) -> None:
+        cls._reset_daily_count_if_needed()
+        now = time.monotonic()
+        cls._request_timestamps = [
+            t for t in cls._request_timestamps if now - t < 60
+        ]
+
+        if cls._daily_count >= cls._daily_request_limit:
+            raise RuntimeError(
+                f"Daily LLM request limit reached ({cls._daily_request_limit})."
+            )
+
+        if len(cls._request_timestamps) >= cls._max_requests_per_minute:
+            oldest = cls._request_timestamps[0]
+            wait_seconds = 60 - (now - oldest) + 0.1
+            time.sleep(wait_seconds)
+            now = time.monotonic()
+            cls._request_timestamps = [
+                t for t in cls._request_timestamps if now - t < 60
+            ]
+
+        if cls._last_request_time is not None:
+            elapsed = now - cls._last_request_time
+            if elapsed < cls._min_request_interval_seconds:
+                time.sleep(cls._min_request_interval_seconds - elapsed)
+
+    @classmethod
+    def _record_request(cls) -> None:
+        cls._reset_daily_count_if_needed()
+        now = time.monotonic()
+        cls._request_timestamps.append(now)
+        cls._daily_count += 1
+        cls._last_request_time = now
+        cls._request_timestamps = [
+            t for t in cls._request_timestamps if now - t < 60
+        ]
+
+    def _hold_decision(
+        self,
+        obs: CommanderObs,
+        memory: CommanderMemory,
+        reason: str = "LLM failure",
+    ) -> CommanderDecision:
+
+        hold_actions = [
+            CommanderAction(
+                side=obs.side,
+                source_zone=zone_id,
+                target_zone=zone_id,
+                units_to_move=0,
+                action_type=ActionType.HOLD,
+            )
+            for zone_id, units in obs.own_unit_per_zone.items()
+            if units > 0
+        ]
+
+        commander_memory = CommanderMemory(
+            current_objective="Hold",
+            last_action_summary=reason,
+            tick_of_last_strategy_changed=memory.tick_of_last_strategy_changed,
+        )
+
+        return CommanderDecision(
+            actions=Actions(actions=hold_actions),
+            memory=commander_memory,
+        )
+
+    def _parse_response(
+        self,
+        response: ModelResponse,
+    ) -> CommanderDecision:
+
+        response_content = response.choices[0].message.content
+
+        if response_content is None:
+            raise ValueError("Empty response")
+
+        data = json.loads(response_content)
+        if isinstance(data.get("actions"), list):
+            data["actions"] = {"actions": data["actions"]}
+
+        return CommanderDecision.model_validate(data)
+
+    def decide(
+        self,
+        obs: CommanderObs,
+        memory: CommanderMemory,
+    ) -> CommanderDecision:
+
+        prompt = CommanderPrompt.replace("{SIDE}", obs.side.value.upper())
+        
+        system_content = prompt + "\n\n" + (
+            "You must respond ONLY with a JSON object. No explanation, no markdown blocks, just raw JSON.\n"
+            "The output JSON must conform to the following schema structure:\n"
+            "{\n"
+            "  \"actions\": [\n"
+            "    {\n"
+            "      \"side\": \"red\" | \"blue\",\n"
+            "      \"source_zone\": int,\n"
+            "      \"target_zone\": int,\n"
+            "      \"units_to_move\": int,\n"
+            "      \"action_type\": \"hold\" | \"move\"\n"
+            "    }\n"
+            "  ],\n"
+            "  \"memory\": {\n"
+            "    \"current_objective\": str,\n"
+            "    \"last_action_summary\": str,\n"
+            "    \"tick_of_last_strategy_changed\": int | null\n"
+            "  }\n"
+            "}\n"
+        )
+
+        messages = [
+            {
+                "role": "system",
+                "content": system_content,
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "observation": obs.model_dump(),
+                        "memory": memory.model_dump(),
+                    }
+                ),
+            },
+        ]
+
+        try:
+            self.__class__._wait_for_request_slot()
+            self.__class__._record_request()
+            response = cast(
+                ModelResponse,
+                completion(
+                    model=self.model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    stream=False,
+                    max_retries=0,
+                    reasoning_effort="low",
+                    max_tokens=600
+                ),
+            )
+            decision = self._parse_response(response)
+            self.last_call_outcome = "success"
+            return decision
+        except Exception as e:
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
+            time.sleep(5)
+        retry_messages = messages + [
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response failed validation. "
+                    "Return a valid CommanderDecision and obey the schema structure."
+                ),
+            }
+        ]
+
+        try:
+            self.__class__._wait_for_request_slot()
+            self.__class__._record_request()
+            response = cast(
+                ModelResponse,
+                completion(
+                    model=self.model,
+                    messages=retry_messages,
+                    response_format={"type": "json_object"},
+                    stream=False,
+                    max_retries=0,
+                    max_tokens=600,
+                    reasoning_effort="low"
+                ),
+            )
+        except Exception as e:
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
+                    
+            self.last_call_outcome = "hold_fallback_api"
+            return self._hold_decision(
+                obs,
+                memory,
+                "Held all positions due to LLM API failure",
+            )
+
+        try:
+            decision = self._parse_response(response)
+            self.last_call_outcome = "retry_success"
+            return decision
+        except Exception as e:
+            print(f"Error type: {type(e).__name__}")
+            print(f"Error message: {e}")
+            self.last_error = f"{type(e).__name__}: {e}"
+            
+            self.last_call_outcome = "hold_fallback_validation"
+            return self._hold_decision(
+                obs,
+                memory,
+                "Held all positions due to schema validation failure",
+            )
+
+
+================================================================================
+FILE: ./ares-sim/agents/Commander/QMIXCommander.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/Commander/RandomCommander.py
+================================================================================
+
+import random
+from typing import Any
+
+from agents.Commander.BaseCommander import BaseCommander
+from agents.models import (
+    ActionType,
+    Actions,
+    CommanderAction,
+    CommanderDecision,
+    CommanderMemory,
+)
+from core.state import CommanderObs
+
+
+class RandomCommander(BaseCommander):
+    """A commander that takes random actions each tick."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def decide(self, obs: CommanderObs, memory: Any) -> CommanderDecision:
+        actions: list[CommanderAction] = []
+
+        for zone_id, units in obs.own_unit_per_zone.items():
+            if units <= 0:
+                continue
+
+            # 50% chance to move, 50% chance to hold
+            if random.random() < 0.5:
+                legal_targets = obs.legal_targets_per_zone.get(zone_id, [])
+                if not legal_targets:
+                    # No valid targets – hold
+                    actions.append(
+                        CommanderAction(
+                            side=obs.side,
+                            source_zone=zone_id,
+                            target_zone=zone_id,
+                            units_to_move=0,
+                            action_type=ActionType.HOLD,
+                        )
+                    )
+                else:
+                    target = random.choice(legal_targets)
+                    move_units = random.randint(1, units)
+                    actions.append(
+                        CommanderAction(
+                            side=obs.side,
+                            source_zone=zone_id,
+                            target_zone=target,
+                            units_to_move=move_units,
+                            action_type=ActionType.MOVE,
+                        )
+                    )
+            else:
+                # Hold
+                actions.append(
+                    CommanderAction(
+                        side=obs.side,
+                        source_zone=zone_id,
+                        target_zone=zone_id,
+                        units_to_move=0,
+                        action_type=ActionType.HOLD,
+                    )
+                )
+
+        memory_out = CommanderMemory(
+            current_objective="Random probing",
+            last_action_summary=f"Random actions for tick {obs.current_tick}",
+            tick_of_last_strategy_changed=obs.current_tick,
+        )
+
+        self.last_call_outcome = "success"
+        self.last_error = None
+
+        return CommanderDecision(actions=Actions(actions=actions), memory=memory_out)
+
+
+================================================================================
+FILE: ./ares-sim/agents/models.py
+================================================================================
+
+from pydantic import BaseModel
+from enum import Enum
+from typing import Literal
+from core.state import Side
+from core.state import BattleState, CommanderObs, ZoneSnapshot 
+
+
+class ActionType(str, Enum):
+    HOLD= "hold"
+    MOVE= "move"
+class CommanderAction(BaseModel):
+   side : Side
+   source_zone:int
+   target_zone:int
+   units_to_move:int
+   action_type : ActionType
+class Actions(BaseModel):
+    actions : list[CommanderAction]
+
+
+class CommanderMemory(BaseModel):
+    current_objective: str
+    last_action_summary: str
+    tick_of_last_strategy_changed: int | None
+
+class CommanderDecision(BaseModel):
+    actions : Actions
+    memory : CommanderMemory
+
+
+CallOutcome = Literal[
+    "success",
+    "retry_success",
+    "hold_fallback_api",
+    "hold_fallback_validation",
+]
+
+
+class TickLogEntry(BaseModel):
+    tick: int
+    side: Side
+    call_outcome: CallOutcome
+    actions: Actions
+    current_objective: str
+    last_action_summary: str
+    tick_of_last_strategy_changed: int | None
+    error_details: str | None = None
+
+
+
+class FullTickSnapshot(BaseModel):
+    tick: int
+    is_engagement_active: bool
+    battle_winner: Side | None
+
+    # 1. GROUND TRUTH (What actually happened)
+    zones: list[ZoneSnapshot]
+    red_fuel: int
+    blue_fuel: int
+    red_weapons_remaining: int
+    blue_weapons_remaining: int
+    zone_3_consecutive_ticks: int
+
+    # 2. PARTIAL OBSERVATIONS (What each side *thinks* is happening)
+    blue_observation: CommanderObs
+    red_observation: CommanderObs
+
+    # 3. DECISIONS MADE (Their orders)
+    blue_decision: CommanderDecision
+    red_decision: CommanderDecision
+
+    # 4. RESOLUTION METRICS (How many orders actually worked)
+    blue_actions_taken: int
+    blue_actions_rejected: int
+    red_actions_taken: int
+    red_actions_rejected: int
+    total_deltas_applied: int
+    # Optional: List the actual deltas if you want extreme verbosity
+    # applied_deltas: list[Delta] 
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/encoder.py
+================================================================================
+
+import torch
+
+from core.state import CommanderObs, Side
+
+
+class ObservationEncoder:
+    def encode(self, obs: CommanderObs) -> torch.Tensor:
+        features = []
+
+        # Side
+        features.append(0.0 if obs.side == Side.RED else 1.0)
+
+        # Current tick
+        features.append(float(obs.current_tick))
+
+        # Friendly units in each zone
+        for zone_id in sorted(obs.own_unit_per_zone.keys()):
+            features.append(float(obs.own_unit_per_zone[zone_id]))
+
+        # Resources
+        features.append(float(obs.own_fuel))
+        features.append(float(obs.own_weapons_remaining))
+
+        # Enemy information
+        features.append(
+            float(obs.enemy_last_known_unit_count)
+            if obs.enemy_last_known_unit_count is not None
+            else -1.0
+        )
+
+        features.append(
+            float(obs.enemy_last_known_zone)
+            if obs.enemy_last_known_zone is not None
+            else -1.0
+        )
+
+        features.append(
+            float(obs.how_many_ticks_ago_enemy_last_seen)
+            if obs.how_many_ticks_ago_enemy_last_seen is not None
+            else -1.0
+        )
+
+        return torch.tensor(
+         features,
+         dtype=torch.float32,
+).unsqueeze(0)
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/epsilon.py
+================================================================================
+
+class EpsilonScheduler:
+    """Linear epsilon decay from a start value to an end value over decay_steps."""
+
+    def __init__(self, start: float, end: float, decay_steps: int) -> None:
+        self.start = start
+        self.end = end
+        self.decay_steps = decay_steps
+
+    def get_epsilon(self, step: int) -> float:
+        # Fraction of decay completed, clamped to [0, 1]
+        progress = min(step / self.decay_steps, 1.0)
+        # Linear interpolation: at step=0 → start, at step=decay_steps → end
+        epsilon = self.start - (self.start - self.end) * progress
+        return epsilon
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/network.py
+================================================================================
+
+import torch
+import torch.nn as nn
+from config.settings import ADJACENCY   # {1:[2], 2:[1,3], 3:[2,4], 4:[3,5], 5:[4]}
+
+class DQNNetwork(nn.Module):
+    def __init__(self, state_dim: int, hidden_dim: int):
+        super().__init__()
+        # Shared encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+        # Zone heads – each output size = 1 (hold) + len(adjacent zones)
+        # We'll store the adjacency for each zone to know which index maps to which target
+        self.adjacency = ADJACENCY
+        self.num_zones = len(ADJACENCY)   # 5
+
+        self.zone_heads = nn.ModuleDict()
+        for zone_id in range(1, self.num_zones + 1):
+            out_size = 1 + len(ADJACENCY[zone_id])
+            self.zone_heads[f"zone_{zone_id}"] = nn.Linear(hidden_dim, out_size)
+            
+
+    def forward(self, state: torch.Tensor):
+        """
+        state shape: (batch_size, state_dim)
+        Returns dict: {
+            "zone_1": tensor (batch, out_size_1),
+            ...
+            "zone_5": tensor (batch, out_size_5)
+        }
+        """
+        features = self.encoder(state)
+        outputs = {}
+        for zone_id in range(1, self.num_zones + 1):
+            outputs[f"zone_{zone_id}"] = self.zone_heads[f"zone_{zone_id}"](features)
+        return outputs
+
+    def get_action_for_zone(self, zone_id: int, q_values: torch.Tensor, unit_count: int) -> tuple[str, int]:
+        """
+        Decode action for a single zone, with masking if zone has no units.
+
+        Args:
+            zone_id: zone ID (1..5)
+            q_values: tensor shape (1, out_size) for this zone
+            unit_count: number of units in this zone (from observation)
+
+        Returns:
+            (action_type, target_zone) where action_type is "hold" or "move"
+        """
+    # Clone and remove batch dimension → shape (out_size,)
+        q = q_values.clone().squeeze(0)
+        if unit_count == 0:
+            mask = torch.zeros_like(q, dtype=torch.bool)
+            mask[1:] = True
+            q = q.masked_fill(mask, float('-inf'))
+        idx = int(q.argmax(dim=0).item())
+
+        if idx == 0:
+            return ("hold", zone_id)
+        else:
+            target = self.adjacency[zone_id][idx - 1]
+            return ("move", target)
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/replay_buffer.py
+================================================================================
+
+import random
+from collections import deque
+import torch
+
+
+class ReplayBuffer:
+    """Stores pre-encoded transitions as tensors.
+
+    All data is stored as tensors ready for batched training.
+    The caller is responsible for encoding observations before pushing.
+    """
+
+    def __init__(self, capacity: int):
+        self.memory: deque[tuple[torch.Tensor, ...]] = deque(maxlen=capacity)
+
+    def push(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        reward: float,
+        next_state: torch.Tensor,
+        done: bool,
+    ):
+        """Store a single transition.
+
+        Args:
+            state: Encoded observation tensor, shape (1, state_dim) or (state_dim,).
+            action: Fixed-size action tensor, shape (num_zones,). Each position
+                    corresponds to one zone; value is the action index taken.
+            reward: Scalar reward for this transition.
+            next_state: Encoded next observation tensor, same shape as state.
+            done: Whether the episode ended after this transition.
+        """
+        self.memory.append((
+            state.detach().squeeze(0),                          # (state_dim,)
+            action.detach(),                                    # (num_zones,)
+            torch.tensor(reward, dtype=torch.float32),          # scalar
+            next_state.detach().squeeze(0),                     # (state_dim,)
+            torch.tensor(float(done), dtype=torch.float32),     # scalar
+        ))
+
+    def sample(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample a batch and return pre-stacked tensors.
+
+        Returns:
+            states:      (batch_size, state_dim)
+            actions:     (batch_size, num_zones)
+            rewards:     (batch_size,)
+            next_states: (batch_size, state_dim)
+            dones:       (batch_size,)
+        """
+        batch = random.sample(self.memory, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (
+            torch.stack(states),
+            torch.stack(actions),
+            torch.stack(rewards),
+            torch.stack(next_states),
+            torch.stack(dones),
+        )
+
+    def __len__(self):
+        return len(self.memory)
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/trainer.py
+================================================================================
+
+import torch
+
+
+class Trainer:
+    """DQN trainer that operates purely on tensors.
+
+    Knows only about the online network, target network, optimizer,
+    replay buffer, discount factor, and batch size. Does not import
+    or manipulate commanders, observations, or simulation classes.
+    """
+
+    def __init__(
+        self,
+        online_net,
+        target_net,
+        optimizer,
+        replay_buffer,
+        batch_size,
+        gamma,
+        sync_every_k_steps,
+        max_grad_norm=10.0,
+    ):
+        self.online_net = online_net
+        self.target_net = target_net
+        self.optimizer = optimizer
+        self.replay_buffer = replay_buffer
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.loss_fn = torch.nn.SmoothL1Loss()
+        self.sync_every_k_steps = sync_every_k_steps
+        self.max_grad_norm = max_grad_norm
+        self.step_count = 0
+
+    def train_step(self):
+        """Run one optimization step on a batch sampled from replay.
+
+        Returns the loss value, or None if not enough experience yet.
+        """
+        if len(self.replay_buffer) < self.batch_size:
+            return None  # not enough experience yet, skip
+
+        # Replay buffer returns pre-stacked tensors
+        obs_batch, action_batch, reward_batch, next_obs_batch, done_batch = (
+            self.replay_buffer.sample(self.batch_size)
+        )
+        # obs_batch:      (batch_size, state_dim)
+        # action_batch:   (batch_size, 5)        — one action index per zone
+        # reward_batch:   (batch_size,)
+        # next_obs_batch: (batch_size, state_dim)
+        # done_batch:     (batch_size,)
+
+        online_outputs = self.online_net(obs_batch)        # dict: zone_1..zone_5 -> (batch, out_size_z)
+        with torch.no_grad():
+            online_next_outputs = self.online_net(next_obs_batch)
+            target_next_outputs = self.target_net(next_obs_batch)
+
+        total_loss = torch.tensor(0.0)
+        zone_losses = {}
+        zone_q_stats = {}
+        for zone_idx, zone_id in enumerate(range(1, 6)):
+            zone_key = f"zone_{zone_id}"
+
+            # Online Q-values for this zone, shape (batch_size, out_size_z)
+            q_online_z = online_outputs[zone_key]
+
+            # Gather the Q-value of the action actually taken for this zone
+            q_taken_z = torch.gather(q_online_z, 1, action_batch[:, zone_idx].unsqueeze(1)).squeeze(1)
+
+            # Double DQN: online net selects action, target net evaluates it
+            best_actions = online_next_outputs[zone_key].argmax(dim=1, keepdim=True)
+            q_next_z = target_next_outputs[zone_key].gather(1, best_actions).squeeze(1)
+
+            # TD target: reward + gamma * Q_target(s', argmax_a Q_online(s', a)) * (1 - done)
+            target_z = (reward_batch + self.gamma * q_next_z * (1 - done_batch)).detach()
+
+            loss_z = self.loss_fn(q_taken_z, target_z)
+            total_loss = total_loss + loss_z
+            zone_losses[zone_id] = loss_z.item()
+            zone_q_stats[zone_id] = {
+                "mean": q_online_z.mean().item(),
+                "max": q_online_z.max().item(),
+            }
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), max_norm=self.max_grad_norm)
+        self.optimizer.step()
+        self.step_count += 1
+        if self.step_count % self.sync_every_k_steps == 0:
+            self.target_net.load_state_dict(self.online_net.state_dict())
+        return total_loss.item(), zone_losses, zone_q_stats
+
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/utils.py
+================================================================================
+
+from core.state import Side, ZoneControl
+def compute_reward(prev_state, post_state):
+    """
+    prev_state, post_state: BattleState snapshots, before/after this tick's deltas
+    returns: float, reward from Blue's perspective (Red = -this)
+    """
+    reward = 0.0
+
+    # Game-ending condition
+    if post_state.battle_winner is not None:
+        reward += 10.0 if post_state.battle_winner == Side.BLUE else -10.0
+        return reward
+
+    prev_streak = prev_state.zone_3_consecutive_ticks
+    post_streak = post_state.zone_3_consecutive_ticks
+
+    prev_zone_3 = next((z for z in prev_state.zones if z.zone_id == 3), None)
+    post_zone_3 = next((z for z in post_state.zones if z.zone_id == 3), None)
+
+    # Streak progression / break logic (Blue's perspective)
+    if post_streak > prev_streak:
+        if post_zone_3 and post_zone_3.side_control == ZoneControl.BLUE:
+            reward += 1.0
+        elif post_zone_3 and post_zone_3.side_control == ZoneControl.RED:
+            reward -= 1.0
+    elif post_streak < prev_streak:
+        if prev_zone_3 and prev_zone_3.side_control == ZoneControl.BLUE:
+            reward -= float(prev_streak)
+        elif prev_zone_3 and prev_zone_3.side_control == ZoneControl.RED:
+            reward += float(prev_streak)
+
+    return reward
+
+================================================================================
+FILE: ./ares-sim/agents/RL/DQN/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/agents/__init__.py
+================================================================================
+
+
+
+
+================================================================================
+FILE: ./ares-sim/config/seeds.py
+================================================================================
+
+from core.state import BattleState, ZoneSnapshot, ZoneControl
+
+def get_seed_1():
+    zone_1 = ZoneSnapshot(
+        zone_id=1,
+        red_units=0,
+        blue_units=100,
+        side_control=ZoneControl.BLUE
+    )
+    zone_2 = ZoneSnapshot(
+        zone_id=2,
+        red_units=0,
+        blue_units=50,
+        side_control=ZoneControl.BLUE
+    )
+    zone_3 = ZoneSnapshot(
+        zone_id=3,
+        red_units=0,
+        blue_units=0,
+        side_control=ZoneControl.NEUTRAL
+    )
+    zone_4 = ZoneSnapshot(
+        zone_id=4,
+        red_units=50,
+        blue_units=0,
+        side_control=ZoneControl.RED
+    ) 
+
+    zone_5 = ZoneSnapshot(
+        zone_id=5,
+        red_units=100,
+        blue_units=0,
+        side_control=ZoneControl.RED
+    )
+    zones = [zone_1, zone_2, zone_3, zone_4, zone_5]
+    battle_state = BattleState(
+        current_tick=0,
+        zones=zones,
+        red_fuel=150,
+        blue_fuel=150,
+        red_weapons_remaining=150,
+        blue_weapons_remaining=150,
+        is_engagement_active=True,
+        battle_winner=None,
+        zone_3_consecutive_ticks=0
+    )
+    return battle_state
+
+
+def get_seed_2():
+    """
+    Case 2: Contested Center Start
+    Zone 3 already has 20 units from both sides instead of being empty/neutral.
+    Tests if the agent fights for zone-3 control from turn 1.
+    """
+    zones = [
+        ZoneSnapshot(zone_id=1, red_units=0, blue_units=100, side_control=ZoneControl.BLUE),
+        ZoneSnapshot(zone_id=2, red_units=0, blue_units=50, side_control=ZoneControl.BLUE),
+        ZoneSnapshot(zone_id=3, red_units=20, blue_units=20, side_control=ZoneControl.NEUTRAL),
+        ZoneSnapshot(zone_id=4, red_units=50, blue_units=0, side_control=ZoneControl.RED),
+        ZoneSnapshot(zone_id=5, red_units=100, blue_units=0, side_control=ZoneControl.RED),
+    ]
+    return BattleState(
+        current_tick=0,
+        zones=zones,
+        red_fuel=190,  
+        blue_fuel=190,
+        red_weapons_remaining=190,
+        blue_weapons_remaining=190,
+        is_engagement_active=True,
+        battle_winner=None,
+        zone_3_consecutive_ticks=0
+    )
+
+
+def get_seed_3():
+    """
+    Case 3: Asymmetric Fuel/Weapons
+    Normal unit distribution matching seed_1, but Blue is under heavy resource pressure.
+    Tests if the agent adapts strategy or blindly executes a script.
+    """
+    zones = [
+        ZoneSnapshot(zone_id=1, red_units=0, blue_units=100, side_control=ZoneControl.BLUE),
+        ZoneSnapshot(zone_id=2, red_units=0, blue_units=50, side_control=ZoneControl.BLUE),
+        ZoneSnapshot(zone_id=3, red_units=0, blue_units=0, side_control=ZoneControl.NEUTRAL),
+        ZoneSnapshot(zone_id=4, red_units=50, blue_units=0, side_control=ZoneControl.RED),
+        ZoneSnapshot(zone_id=5, red_units=100, blue_units=0, side_control=ZoneControl.RED),
+    ]
+    return BattleState(
+        current_tick=0,
+        zones=zones,
+        red_fuel=150,
+        blue_fuel=50,  
+        red_weapons_remaining=150,
+        blue_weapons_remaining=50,  
+        is_engagement_active=True,
+        battle_winner=None,
+        zone_3_consecutive_ticks=0
+    )
+
+
+def get_seed_4():
+    """
+    Case 4: Reversed Flank Strength
+    Mirrors seed_1's flank unit distribution (Zone 1/2 swapped with Zone 4/5).
+    Tests generalization ("push weak flank") vs hardcoding ("zone_1 is always strong").
+    """
+    zones = [
+        ZoneSnapshot(zone_id=1, red_units=0, blue_units=50, side_control=ZoneControl.BLUE),    
+        ZoneSnapshot(zone_id=2, red_units=0, blue_units=100, side_control=ZoneControl.BLUE),    
+        ZoneSnapshot(zone_id=3, red_units=0, blue_units=0, side_control=ZoneControl.NEUTRAL),
+        ZoneSnapshot(zone_id=4, red_units=100, blue_units=0, side_control=ZoneControl.RED),   
+        ZoneSnapshot(zone_id=5, red_units=50, blue_units=0, side_control=ZoneControl.RED),     
+    ]
+    return BattleState(
+        current_tick=0,
+        zones=zones,
+        red_fuel=150,
+        blue_fuel=150,
+        red_weapons_remaining=150,
+        blue_weapons_remaining=150,
+        is_engagement_active=True,
+        battle_winner=None,
+        zone_3_consecutive_ticks=0
+    )
+
+
+def get_seed_5():
+    """
+    Case 5: Mixed pressure with contested center and uneven flanks.
+    Tests the agent against an LLM commander in a more balanced, dynamic battle.
+    """
+    zones = [
+        ZoneSnapshot(zone_id=1, red_units=20, blue_units=80, side_control=ZoneControl.BLUE),
+        ZoneSnapshot(zone_id=2, red_units=10, blue_units=40, side_control=ZoneControl.BLUE),
+        ZoneSnapshot(zone_id=3, red_units=30, blue_units=30, side_control=ZoneControl.NEUTRAL),
+        ZoneSnapshot(zone_id=4, red_units=70, blue_units=10, side_control=ZoneControl.RED),
+        ZoneSnapshot(zone_id=5, red_units=90, blue_units=5, side_control=ZoneControl.RED),
+    ]
+    return BattleState(
+        current_tick=0,
+        zones=zones,
+        red_fuel=170,
+        blue_fuel=130,
+        red_weapons_remaining=170,
+        blue_weapons_remaining=130,
+        is_engagement_active=True,
+        battle_winner=None,
+        zone_3_consecutive_ticks=0,
+    )
+
+
+================================================================================
+FILE: ./ares-sim/config/settings.py
+================================================================================
+
+from pydantic_settings import BaseSettings,SettingsConfigDict
+
+class Settings(BaseSettings):
+    groq_api_key: str
+    model_1: str
+        
+    model_config = SettingsConfigDict(env_file=".env")
+
+
+ZONE_CONTEST_RATIO= 0.9
+ZONE_3_WIN_THRESHOLD=6
+
+ADJACENCY = {
+    1: [2],
+    2: [1, 3],
+    3: [2, 4],
+    4: [3, 5],
+    5: [4],
+}
+
+settings = Settings()
+
+
+
+================================================================================
+FILE: ./ares-sim/config/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/core/action_resolver.py
+================================================================================
+
+from typing import NamedTuple
+
+from config.settings import ADJACENCY
+from core.attrition import calculate_attrition
+from core.state import BattleState, Side, ZoneControl
+from agents.models import ActionType
+
+
+class Delta(NamedTuple):
+    """Represents a unit/fuel change to apply to a zone."""
+    zone_id: int
+    side: Side
+    unit_delta: int
+    fuel_delta: int
+    weapons_delta: int
+
+
+def compute_attacker_controls_flank(state: BattleState, action_side: Side, target_zone_id: int) -> bool:
+    """
+    Determine if the attacker controls the flank by checking adjacent zones.
+    Attacker controls flank if they control adjacent zones.
+    """
+    adjacent_zone_ids = ADJACENCY.get(target_zone_id, [])
+
+    for adj_zone_id in adjacent_zone_ids:
+        adj_zone = next(
+            (z for z in state.zones if z.zone_id == adj_zone_id),
+            None,
+        )
+        if adj_zone is None:
+            continue
+
+        # Check if attacker controls this adjacent zone
+        if action_side == Side.BLUE:
+            if adj_zone.side_control == ZoneControl.BLUE:
+                return True
+        else:  # RED
+            if adj_zone.side_control == ZoneControl.RED:
+                return True
+
+    return False
+
+
+def resolve_actions(state: BattleState, all_actions: list) -> tuple:
+    """
+    Validate all actions and build deltas without mutating state.
+    
+    Returns:
+        pending_deltas: list of Delta objects to apply
+        actions_taken: dict of {Side: count}
+        actions_rejected: dict of {Side: count}
+    """
+    pending_deltas = []
+    actions_taken = {Side.BLUE: 0, Side.RED: 0}
+    actions_rejected = {Side.BLUE: 0, Side.RED: 0}
+    cumulative_outflow = {}  # (zone_id, side) -> total units drained this tick
+
+    for action in all_actions:
+        if action.action_type == ActionType.HOLD:
+            continue
+
+        # Snapshot zone state (read-only)
+        source_zone_snapshot = next(
+            (z for z in state.zones if z.zone_id == action.source_zone),
+            None,
+        )
+        target_zone_snapshot = next(
+            (z for z in state.zones if z.zone_id == action.target_zone),
+            None,
+        )
+        allowed_targets = ADJACENCY.get(action.source_zone, [])
+        if source_zone_snapshot is None or target_zone_snapshot is None:
+            actions_rejected[action.side] += 1
+            continue
+        if action.target_zone not in allowed_targets:
+            actions_rejected[action.side] += 1
+            continue
+
+        # Verify attacker has sufficient units in source zone (including cumulative outflow this tick)
+        source_key = (action.source_zone, action.side)
+        already_drained = cumulative_outflow.get(source_key, 0)
+
+        if action.side == Side.BLUE:
+            available_units = source_zone_snapshot.blue_units - already_drained
+            if available_units < action.units_to_move:
+                actions_rejected[action.side] += 1
+                continue
+        else:  # RED
+            available_units = source_zone_snapshot.red_units - already_drained
+            if available_units < action.units_to_move:
+                actions_rejected[action.side] += 1
+                continue
+
+        # Action passes validation — increment counter only now
+        actions_taken[action.side] += 1
+        cumulative_outflow[source_key] = already_drained + action.units_to_move
+
+        # Get attacker and defender units from snapshot
+        attacker_units = action.units_to_move
+        defender_units = (
+            target_zone_snapshot.red_units
+            if action.side == Side.BLUE
+            else target_zone_snapshot.blue_units
+        )
+
+        # Get attacker fuel
+        attacker_fuel = (
+            state.blue_fuel
+            if action.side == Side.BLUE
+            else state.red_fuel
+        )
+
+        # Compute attacker_controls_flank from actual adjacency/zone state
+        attacker_controls_flank = compute_attacker_controls_flank(
+            state, action.side, action.target_zone
+        )
+
+        # Compute attacker_controls_zone_3
+        attacker_controls_zone_3 = (
+            target_zone_snapshot.zone_id == 3
+            and (
+                (action.side == Side.BLUE and target_zone_snapshot.side_control == ZoneControl.BLUE)
+                or (action.side == Side.RED and target_zone_snapshot.side_control == ZoneControl.RED)
+            )
+        )
+
+        # Calculate attrition
+        attrition_result = calculate_attrition(
+            attacker_units=attacker_units,
+            defender_units=defender_units,
+            attacker_fuel=attacker_fuel,
+            attacker_controls_flank=attacker_controls_flank,
+            attacker_controls_zone_3=attacker_controls_zone_3,
+        )
+
+        # Classic wargame movement: units relocate from source to target
+        attacker_survivors = attacker_units - attrition_result.attacker_losses
+        opponent_side = Side.RED if action.side == Side.BLUE else Side.BLUE
+
+        # Delta 1: Remove units from source zone
+        pending_deltas.append(
+            Delta(
+                zone_id=action.source_zone,
+                side=action.side,
+                unit_delta=-attacker_units,
+                fuel_delta=-attrition_result.attacker_fuel_penalty,
+                weapons_delta=-attrition_result.attacker_weapons_consumed,
+            )
+        )
+
+        # Delta 2: Add surviving attacker units to target zone
+        pending_deltas.append(
+            Delta(
+                zone_id=action.target_zone,
+                side=action.side,
+                unit_delta=attacker_survivors,
+                fuel_delta=0,
+                weapons_delta=0,
+            )
+        )
+
+        # Delta 3: Apply defender losses to target zone
+        pending_deltas.append(
+            Delta(
+                zone_id=action.target_zone,
+                side=opponent_side,
+                unit_delta=-attrition_result.defender_losses,
+                fuel_delta=0,
+                weapons_delta=0,
+            )
+        )
+
+    return pending_deltas, actions_taken, actions_rejected
+
+================================================================================
+FILE: ./ares-sim/core/attrition.py
+================================================================================
+
+from pydantic import BaseModel, ConfigDict
+import math
+
+
+class AttritionResult(BaseModel):
+    attacker_losses: int
+    defender_losses: int
+    attacker_fuel_penalty: int
+    attacker_weapons_consumed: int
+
+    model_config = ConfigDict(frozen=True)
+
+
+def calculate_attrition(
+    attacker_units: int,
+    defender_units: int,
+    attacker_fuel: int,
+    attacker_controls_flank: bool,
+    attacker_controls_zone_3: bool,
+) -> AttritionResult:
+    # Base losses before any modifiers
+    # Schema decision: attacker loses 8% of defender units, defender loses 5% of attacker units
+    attacker_losses = defender_units * 0.08
+    defender_losses = attacker_units * 0.05
+
+    fuel_penalty = 0
+
+    # Numerical advantage modifier
+    force_ratio = min(
+    math.sqrt(attacker_units / max(defender_units, 1)),
+    2.0,
+)
+
+    # Larger attacking force inflicts proportionally more losses
+    defender_losses *= force_ratio
+
+    # Zone 3 control provides a positional advantage
+    if attacker_controls_zone_3:
+        defender_losses *= 1.2
+
+    # Lack of flank control reduces combat effectiveness
+    if not attacker_controls_flank:
+        defender_losses *= 0.7
+        fuel_penalty = 10
+
+    # Fuel level impacts sortie effectiveness
+    fuel_effectiveness = max(
+    0.5,
+    min(attacker_fuel / 150, 1.0),
+)
+    defender_losses *= fuel_effectiveness
+
+    # Weapons expenditure scales with engagement activity
+    attacker_weapons_consumed = round(attacker_units * 0.05)
+
+    # Convert to integers and ensure losses never exceed available units
+    attacker_losses = min(round(attacker_losses), attacker_units)
+    defender_losses = min(round(defender_losses), defender_units)
+
+    return AttritionResult(
+        attacker_losses=attacker_losses,
+        defender_losses=defender_losses,
+        attacker_fuel_penalty=fuel_penalty,
+        attacker_weapons_consumed=attacker_weapons_consumed,
+    )
+
+
+================================================================================
+FILE: ./ares-sim/core/intel.py
+================================================================================
+
+from config.settings import ADJACENCY
+from core.state import BattleState, Side, ZoneControl
+
+
+def get_visible_zones_for_side(state: BattleState, side: Side) -> set[int]:
+    """
+    Compute zones visible to a side based on control.
+    
+    A zone is visible if:
+    - The side controls it directly, OR
+    - The side controls an adjacent zone
+    
+    This represents scouting/intelligence presence.
+    """
+    visible = set()
+
+    for zone in state.zones:
+        # Check if we control this zone
+        if side == Side.BLUE and zone.side_control == ZoneControl.BLUE:
+            visible.add(zone.zone_id)
+        elif side == Side.RED and zone.side_control == ZoneControl.RED:
+            visible.add(zone.zone_id)
+        else:
+            # Check if we control an adjacent zone
+            adjacent_zone_ids = ADJACENCY.get(zone.zone_id, [])
+            for adj_id in adjacent_zone_ids:
+                adj_zone = next(
+                    (z for z in state.zones if z.zone_id == adj_id),
+                    None,
+                )
+                if adj_zone is None:
+                    continue
+
+                if side == Side.BLUE and adj_zone.side_control == ZoneControl.BLUE:
+                    visible.add(zone.zone_id)
+                    break
+                elif side == Side.RED and adj_zone.side_control == ZoneControl.RED:
+                    visible.add(zone.zone_id)
+                    break
+
+    return visible
+
+
+def update_enemy_memory(state: BattleState, enemy_memory: dict, side: Side) -> None:
+    """
+    Update memory for a side based on current visibility.
+    
+    If enemy is visible in any visible zone, update memory with the
+    closest enemy zone and unit count. If not visible, memory persists
+    (this is the decay mechanic: stale info remains until refreshed).
+    """
+    visible_zones = get_visible_zones_for_side(state, side)
+
+    closest_enemy_zone = None
+    enemy_units_in_closest = None
+    min_distance_to_ref = float("inf")
+    ref_zone = 2 if side == Side.BLUE else 4
+
+    for zone in state.zones:
+        if zone.zone_id not in visible_zones:
+            continue
+
+        enemy_count = (
+            zone.red_units if side == Side.BLUE else zone.blue_units
+        )
+
+        if enemy_count > 0:
+            distance = abs(zone.zone_id - ref_zone)
+            if distance < min_distance_to_ref:
+                min_distance_to_ref = distance
+                closest_enemy_zone = zone.zone_id
+                enemy_units_in_closest = enemy_count
+
+    # If enemy found in visible zones, update memory
+    if closest_enemy_zone is not None:
+        enemy_memory[side] = {
+            "zone": closest_enemy_zone,
+            "units": enemy_units_in_closest,
+            "tick_seen": state.current_tick,
+        }
+    # else: memory unchanged (stale sighting persists)
+
+================================================================================
+FILE: ./ares-sim/core/obs.py
+================================================================================
+
+from typing import Mapping
+from config.settings import ADJACENCY
+from core.state import BattleState, CommanderObs, Side
+
+
+def build_obs(
+    state: BattleState,
+    side: Side,
+    enemy_memory: Mapping[str, int | None]) -> CommanderObs:
+    """Build a commander observation from current state and persistent memory.
+    
+    Args:
+        state: Ground truth battle state
+        side: Which side this observation is for (BLUE or RED)
+        enemy_memory: Persistent memory dict with keys:
+            - "zone": int | None (last known enemy zone)
+            - "units": int | None (last known enemy unit count)
+            - "tick_seen": int | None (tick when enemy was last observed)
+    
+    Returns:
+        CommanderObs with partial observability based on memory, not ground truth.
+    """
+    if side == Side.BLUE:
+        own_units = {z.zone_id: z.blue_units for z in state.zones}
+        own_fuel = state.blue_fuel
+        own_weapons = state.blue_weapons_remaining
+    else:
+        own_units = {z.zone_id: z.red_units for z in state.zones}
+        own_fuel = state.red_fuel
+        own_weapons = state.red_weapons_remaining
+
+    # Extract memory; if any key missing, treat as no sighting
+    last_enemy_known_zone = enemy_memory.get("zone")
+    last_enemy_known_units = enemy_memory.get("units")
+    tick_seen = enemy_memory.get("tick_seen")
+    
+    # Compute decay: how many ticks since last sighting?
+    if tick_seen is not None:
+        how_many_ticks_ago_enemy_last_seen = state.current_tick - tick_seen
+    else:
+        how_many_ticks_ago_enemy_last_seen = None
+
+    legal_targets_per_zone = {
+            zone_id : ADJACENCY.get(zone_id,[])
+            for zone_id, count in own_units.items()
+            if count > 0
+            }
+
+    return CommanderObs(
+        side=side,
+        current_tick=state.current_tick,
+        own_unit_per_zone=own_units,
+        own_fuel=own_fuel,
+        own_weapons_remaining=own_weapons,
+        enemy_last_known_unit_count=last_enemy_known_units,
+        enemy_last_known_zone=last_enemy_known_zone,
+        how_many_ticks_ago_enemy_last_seen=how_many_ticks_ago_enemy_last_seen,
+        legal_targets_per_zone=legal_targets_per_zone
+    )
+
+
+
+
+    
+
+
+
+
+================================================================================
+FILE: ./ares-sim/core/outcomes.py
+================================================================================
+
+from core.state import BattleState, Side, ZoneControl
+
+from config.settings import ZONE_3_WIN_THRESHOLD
+
+
+
+
+def check_win_condition(state: BattleState) -> BattleState:
+    zone3 = next(
+            zone for zone in state.zones
+            if zone.zone_id == 3             
+            )
+    if ( zone3.side_control in (
+        ZoneControl.RED, ZoneControl.BLUE
+        )
+        and state.zone_3_consecutive_ticks >= ZONE_3_WIN_THRESHOLD):
+
+        winner = (
+                Side.RED
+                if zone3.side_control == ZoneControl.RED
+                else Side.BLUE
+                )
+        return state.model_copy(
+                update={
+                    "is_engagement_active" : False,
+                    "battle_winner" : winner
+            
+            })
+    total_red_units = sum(
+        zone.red_units
+        for zone in state.zones
+    )
+
+    total_blue_units = sum(
+        zone.blue_units
+        for zone in state.zones
+    )
+
+    if total_red_units == 0:
+        return state.model_copy(
+            update={
+                "is_engagement_active": False,
+                "battle_winner": Side.BLUE,
+            }
+        )
+
+    if total_blue_units == 0:
+        return state.model_copy(
+            update={
+                "is_engagement_active": False,
+                "battle_winner": Side.RED,
+            }
+        )
+
+    # No win condition met
+    return state
+
+    
+
+
+================================================================================
+FILE: ./ares-sim/core/state.py
+================================================================================
+
+from enum import Enum
+from pydantic import BaseModel, Field , ConfigDict
+class Side(str, Enum):
+    RED = "red"
+    BLUE = "blue"
+        
+
+class ZoneControl(str, Enum):
+    RED = "red"
+    BLUE = "blue"
+    NEUTRAL = "neutral"
+    CONTESTED = "contested"
+
+class ZoneSnapshot(BaseModel):
+    """
+    Snapshot of a single zone at the current simulation tick.
+    """
+
+    zone_id: int = Field(ge=0)
+
+    red_units: int = Field(
+        ge=0,
+        description="Number of red units currently present in the zone.",
+    )
+
+    blue_units: int = Field(
+        ge=0,
+        description="Number of blue units currently present in the zone.",
+    )
+
+    side_control: ZoneControl = Field(
+        description="Current control state of the zone."
+    )
+    model_config = ConfigDict(frozen=True)
+
+
+class BattleState(BaseModel):
+    """
+    Ground-truth simulation state maintained by the environment.
+
+    Commanders should not directly access this model.
+    Instead, they receive a CommanderOrbs generated from it.
+    """
+
+    current_tick: int = Field(ge=0)
+
+    zones: list[ZoneSnapshot]
+
+    red_fuel: int = Field(ge=0)
+    blue_fuel: int = Field(ge=0)
+
+    red_weapons_remaining: int = Field(ge=0)
+    blue_weapons_remaining: int = Field(ge=0)
+
+    is_engagement_active: bool
+
+    battle_winner: Side | None = Field(
+        default=None,
+        description="Winning side if the battle has concluded.",
+    )
+
+    zone_3_consecutive_ticks:int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Consecutive ticks zone 3 has remained under its current control state. "),
+    )
+    model_config = ConfigDict(frozen=True)
+
+
+class CommanderObs(BaseModel):
+    """
+    Partial observation provided to a commander agent.
+
+    Represents what the commander currently knows about the battlefield,
+    not the full simulation state.
+    """
+
+    side: Side
+
+    current_tick: int = Field(ge=0)
+
+    own_unit_per_zone: dict[int, int] = Field(
+        description="Observed friendly unit count per zone."
+    )
+
+    own_fuel: int = Field(ge=0)
+
+    own_weapons_remaining: int = Field(ge=0)
+
+    enemy_last_known_unit_count: int | None = Field(
+        default=None,
+        ge=0,
+        description="Most recently observed enemy unit count.",
+    )
+
+    enemy_last_known_zone: int | None = Field(
+        default=None,
+        ge=0,
+        description="Zone where the enemy was most recently observed.",
+    )
+
+    how_many_ticks_ago_enemy_last_seen: int | None = Field(
+        default=None,
+        ge=0,
+        description="Ticks elapsed since the last confirmed enemy sighting.",
+    )
+    model_config = ConfigDict(frozen=True)
+    
+    legal_targets_per_zone: dict[int, list[int]] = Field(
+    default_factory=dict,
+    description=(
+        "For each zone you currently occupy, the exact list of zone_ids "
+        "you are permitted to target with a move action. Use this directly "
+        "as the source of truth for adjacency — do not infer adjacency yourself."
+    ),
+)
+
+
+
+================================================================================
+FILE: ./ares-sim/core/state_updater.py
+================================================================================
+
+from core.state import BattleState, Side, ZoneControl
+from core.zones import determine_zone_control
+from core.action_resolver import Delta
+
+
+def apply_deltas(state: BattleState, deltas: list[Delta]) -> BattleState:
+    """Apply all pending deltas to state in one batch."""
+    if not deltas:
+        return state
+
+    # Group deltas by zone for efficient batch update
+    zone_updates = {}
+    blue_fuel_total = state.blue_fuel
+    red_fuel_total = state.red_fuel
+    blue_weapons_total = state.blue_weapons_remaining
+    red_weapons_total = state.red_weapons_remaining
+
+    for delta in deltas:
+        if delta.zone_id not in zone_updates:
+            zone_updates[delta.zone_id] = {Side.BLUE: 0, Side.RED: 0}
+        
+        zone_updates[delta.zone_id][delta.side] += delta.unit_delta
+
+        # Apply fuel deltas
+        if delta.side == Side.BLUE:
+            blue_fuel_total += delta.fuel_delta
+            blue_weapons_total += delta.weapons_delta
+        else:
+            red_fuel_total += delta.fuel_delta
+            red_weapons_total += delta.weapons_delta
+
+    # Rebuild zones with updated unit counts
+    updated_zones = []
+    for zone in state.zones:
+        if zone.zone_id in zone_updates:
+            blue_units = max(0, zone.blue_units + zone_updates[zone.zone_id][Side.BLUE])
+            red_units = max(0, zone.red_units + zone_updates[zone.zone_id][Side.RED])
+            
+            # Recalculate zone control based on updated units
+            new_control = determine_zone_control(red_units, blue_units)
+            
+            updated_zones.append(
+                zone.model_copy(
+                    update={
+                        "blue_units": blue_units,
+                        "red_units": red_units,
+                        "side_control": new_control,
+                    }
+                )
+            )
+        else:
+            updated_zones.append(zone)
+
+    # Return updated state with all deltas applied
+    return state.model_copy(
+        update={
+            "zones": updated_zones,
+            "blue_fuel": max(0, blue_fuel_total),
+            "red_fuel": max(0, red_fuel_total),
+            "blue_weapons_remaining": max(0, blue_weapons_total),
+            "red_weapons_remaining": max(0, red_weapons_total),
+        }
+    )
+
+================================================================================
+FILE: ./ares-sim/core/tick.py
+================================================================================
+
+import pathlib
+import logging
+from dataclasses import dataclass, field
+from typing import Callable
+
+from core.state import BattleState, Side, ZoneControl
+from core.obs import build_obs
+from agents.models import ActionType, TickLogEntry, CommanderMemory, CommanderDecision
+from agents.Commander.BaseCommander import BaseCommander
+from core.outcomes import check_win_condition
+from core.zones import update_zone_3_ticks
+from core.intel import update_enemy_memory
+from core.action_resolver import resolve_actions
+from core.state_updater import apply_deltas
+from agents.models import FullTickSnapshot, CommanderObs
+from agents.RL.DQN.utils import compute_reward
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class StepResult:
+    """Everything an RL algorithm needs after one simulation tick."""
+    blue_obs: CommanderObs          # Observation Blue received this tick
+    red_obs: CommanderObs           # Observation Red received this tick
+    blue_action: CommanderDecision  # Action Blue chose
+    red_action: CommanderDecision   # Action Red chose
+    state: BattleState              # Updated state after this tick
+    blue_reward: float              # Reward for Blue this tick
+    red_reward: float               # Reward for Red this tick
+    done: bool                      # Whether the episode ended
+    next_blue_obs: "CommanderObs | None"  # Next tick's Blue observation (None if done)
+    next_red_obs: "CommanderObs | None"   # Next tick's Red observation (None if done)
+    info: dict = field(default_factory=dict)  # Extra metadata
+
+
+class TickEngine:
+    def __init__(
+        self,
+        state: BattleState,
+        blue_commander: BaseCommander,
+        red_commander: BaseCommander,
+        log_path: str | pathlib.Path | None = None,
+        reward_fn: Callable[[BattleState, BattleState], float] | None = None,
+    ):
+        self.state = state
+        self.blue = blue_commander
+        self.red = red_commander
+        self.log_path = pathlib.Path(log_path) if log_path else None
+        if self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_file_handle = self.log_path.open("w", encoding="utf-8")
+        else:
+            self.log_file_handle = None
+        self.tick_log: list[TickLogEntry] = []
+
+        # Reward function (default: DQN compute_reward from Blue's perspective)
+        self._reward_fn = reward_fn if reward_fn is not None else compute_reward
+
+        # Enemy memory: {Side -> {zone, units, tick_seen}}
+        # Persists across ticks; updated only when enemy visible in controlled zones
+        self.enemy_memory: dict[Side, dict[str, int | None]] = {
+            Side.BLUE: {"zone": None, "units": None, "tick_seen": None},
+            Side.RED: {"zone": None, "units": None, "tick_seen": None},
+        }
+
+        # Commander memory — threaded forward across ticks
+        self.blue_memory = CommanderMemory(
+            current_objective="",
+            last_action_summary="",
+            tick_of_last_strategy_changed=None,
+        )
+        self.red_memory = CommanderMemory(
+            current_objective="",
+            last_action_summary="",
+            tick_of_last_strategy_changed=None,
+        )
+
+    @property
+    def done(self) -> bool:
+        """Whether the episode has ended."""
+        return not self.state.is_engagement_active
+
+    def step(self) -> StepResult:
+        """Execute a single simulation tick and return everything an RL loop needs.
+
+        Raises RuntimeError if the episode has already ended.
+        """
+        if not self.state.is_engagement_active:
+            raise RuntimeError("Episode has ended. Create a new TickEngine to start a new episode.")
+
+        # --- 1. Update enemy memory for both sides ---
+        update_enemy_memory(self.state, self.enemy_memory, Side.BLUE)
+        update_enemy_memory(self.state, self.enemy_memory, Side.RED)
+
+        # --- 2. Build observations ---
+        blue_obs = build_obs(self.state, Side.BLUE, self.enemy_memory[Side.BLUE])
+        red_obs = build_obs(self.state, Side.RED, self.enemy_memory[Side.RED])
+
+        # --- 3. Collect decisions (alternating turn order for fairness) ---
+        if self.state.current_tick % 2 == 0:
+            turn_order = [
+                (Side.BLUE, self.blue, blue_obs),
+                (Side.RED, self.red, red_obs),
+            ]
+        else:
+            turn_order = [
+                (Side.RED, self.red, red_obs),
+                (Side.BLUE, self.blue, blue_obs),
+            ]
+
+        results = {}
+        for side, commander, obs in turn_order:
+            mem = self.blue_memory if side == Side.BLUE else self.red_memory
+            results[side] = (commander.decide(obs, mem), commander.last_call_outcome)
+
+        blue_decision, blue_outcome = results[Side.BLUE]
+        red_decision, red_outcome = results[Side.RED]
+
+        # Thread updated memory forward
+        self.blue_memory = blue_decision.memory
+        self.red_memory = red_decision.memory
+
+        # --- 4. Resolve actions ---
+        all_actions = blue_decision.actions.actions + red_decision.actions.actions
+        pending_deltas, actions_taken, actions_rejected = resolve_actions(
+            self.state, all_actions
+        )
+
+        # --- 5. Capture pre-delta state for reward computation ---
+        prev_state = self.state
+
+        # Save previous zone 3 control before applying deltas
+        prev_zone_3_control = next(
+            (z.side_control for z in self.state.zones if z.zone_id == 3),
+            None,
+        )
+
+        # --- 6. Apply deltas ---
+        self.state = apply_deltas(self.state, pending_deltas)
+
+        # Log tick result
+        logger.info(
+            f"Tick {self.state.current_tick}: "
+            f"Blue actions executed={actions_taken[Side.BLUE]}, rejected={actions_rejected[Side.BLUE]}, "
+            f"Red actions executed={actions_taken[Side.RED]}, rejected={actions_rejected[Side.RED]}, "
+            f"Deltas applied={len(pending_deltas)}, "
+            f"Zone control: {[(z.zone_id, z.side_control) for z in self.state.zones]}"
+        )
+
+        # --- 7. Update zone 3 tick counter ---
+        zone_3 = next((z for z in self.state.zones if z.zone_id == 3), None)
+        if zone_3:
+            new_consecutive_ticks = update_zone_3_ticks(
+                current_control=zone_3.side_control,
+                previous_control=prev_zone_3_control or zone_3.side_control,
+                consecutive_ticks=self.state.zone_3_consecutive_ticks,
+            )
+            self.state = self.state.model_copy(
+                update={"zone_3_consecutive_ticks": new_consecutive_ticks}
+            )
+
+        # --- 8. Check win condition ---
+        self.state = check_win_condition(state=self.state)
+
+        # --- 9. Compute rewards ---
+        blue_reward = self._reward_fn(prev_state, self.state)
+        red_reward = -blue_reward  # Zero-sum game
+
+        # --- 10. Write log snapshot ---
+        if self.log_file_handle:
+            snapshot = FullTickSnapshot(
+                tick=self.state.current_tick,
+                is_engagement_active=self.state.is_engagement_active,
+                battle_winner=self.state.battle_winner,
+                zones=self.state.zones,
+                red_fuel=self.state.red_fuel,
+                blue_fuel=self.state.blue_fuel,
+                red_weapons_remaining=self.state.red_weapons_remaining,
+                blue_weapons_remaining=self.state.blue_weapons_remaining,
+                zone_3_consecutive_ticks=self.state.zone_3_consecutive_ticks,
+                blue_observation=blue_obs,
+                red_observation=red_obs,
+                blue_decision=blue_decision,
+                red_decision=red_decision,
+                blue_actions_taken=actions_taken[Side.BLUE],
+                blue_actions_rejected=actions_rejected[Side.BLUE],
+                red_actions_taken=actions_taken[Side.RED],
+                red_actions_rejected=actions_rejected[Side.RED],
+                total_deltas_applied=len(pending_deltas),
+            )
+            self.log_file_handle.write(snapshot.model_dump_json() + "\n")
+            self.log_file_handle.flush()
+
+        # Human-readable console logging
+        logger.info(
+            f"Tick {self.state.current_tick}: "
+            f"Blue: {actions_taken[Side.BLUE]} taken, {actions_rejected[Side.BLUE]} rej | "
+            f"Red: {actions_taken[Side.RED]} taken, {actions_rejected[Side.RED]} rej | "
+            f"Z3 Control: {zone_3.side_control if zone_3 else 'N/A'} ({self.state.zone_3_consecutive_ticks})"
+        )
+
+        # --- 11. Advance tick ---
+        self.state = self.state.model_copy(
+            update={"current_tick": self.state.current_tick + 1}
+        )
+
+        # --- 12. Build next observations (or None if episode ended) ---
+        episode_done = not self.state.is_engagement_active
+
+        if not episode_done:
+            # Pre-compute next observations for RL transition tuples
+            update_enemy_memory(self.state, self.enemy_memory, Side.BLUE)
+            update_enemy_memory(self.state, self.enemy_memory, Side.RED)
+            next_blue_obs = build_obs(self.state, Side.BLUE, self.enemy_memory[Side.BLUE])
+            next_red_obs = build_obs(self.state, Side.RED, self.enemy_memory[Side.RED])
+        else:
+            next_blue_obs = None
+            next_red_obs = None
+
+        return StepResult(
+            blue_obs=blue_obs,
+            red_obs=red_obs,
+            blue_action=blue_decision,
+            red_action=red_decision,
+            state=self.state,
+            blue_reward=blue_reward,
+            red_reward=red_reward,
+            done=episode_done,
+            next_blue_obs=next_blue_obs,
+            next_red_obs=next_red_obs,
+            info={
+                "actions_taken": actions_taken,
+                "actions_rejected": actions_rejected,
+                "deltas_applied": len(pending_deltas),
+            },
+        )
+
+    def run(self, max_ticks: int) -> BattleState:
+        """Run the simulation for up to max_ticks. Convenience wrapper around step().
+
+        Maintains full backward compatibility with existing scripts.
+        """
+        while self.state.is_engagement_active and self.state.current_tick < max_ticks:
+            self.step()
+
+        if self.log_file_handle:
+            self.log_file_handle.close()
+
+        return self.state
+
+
+================================================================================
+FILE: ./ares-sim/core/zones.py
+================================================================================
+
+
+from core.state import ZoneControl
+from config.settings import ZONE_CONTEST_RATIO
+
+
+def determine_zone_control(
+    red_units: int,
+    blue_units: int,
+) -> ZoneControl:
+    # No forces present
+    if red_units == 0 and blue_units == 0:
+        return ZoneControl.NEUTRAL
+
+    # One side completely absent
+    if red_units == 0:
+        return ZoneControl.BLUE
+
+    if blue_units == 0:
+        return ZoneControl.RED
+
+    # Relative force comparison
+    smaller_force = min(red_units, blue_units)
+    larger_force = max(red_units, blue_units)
+
+    ratio = smaller_force / larger_force
+
+    # Forces are close enough that neither side has control
+    if ratio >= ZONE_CONTEST_RATIO:
+        return ZoneControl.CONTESTED
+
+    # Red has clear superiority
+    if red_units > blue_units:
+        return ZoneControl.RED
+
+    # Blue has clear superiority
+    return ZoneControl.BLUE
+
+def update_zone_3_ticks(current_control: ZoneControl , previous_control: ZoneControl
+                        ,consecutive_ticks: int) -> int:
+    
+    if current_control in (
+    ZoneControl.NEUTRAL,
+    ZoneControl.CONTESTED):
+        return 0
+    if current_control ==previous_control:
+        return consecutive_ticks + 1
+    return 1
+
+
+================================================================================
+FILE: ./ares-sim/core/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/memory/llm_memory.py
+================================================================================
+
+# from agents.models import CommanderMemory
+
+# this was suposed to have Generative Agents, memory pattern with degradation 
+
+
+================================================================================
+FILE: ./ares-sim/memory/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/simulation/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./ares-sim/__init__.py
+================================================================================
+
+print("Hello World")
+
+
+================================================================================
+FILE: ./logs/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./scripts/dqn_eval.py
+================================================================================
+
+"""
+Evaluation harness for ARES DQN.
+Runs a trained checkpoint against RandomCommander across multiple seeds.
+Reports per-seed metrics + pooled evaluation metrics.
+"""
+
+import sys
+import pathlib
+import math
+from collections import Counter
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "ares-sim"))
+
+import torch
+
+from config.seeds import (
+    get_seed_1,
+    get_seed_2,
+    get_seed_3,
+    get_seed_4
+)
+
+from core.tick import TickEngine
+from core.state import Side, ZoneControl
+
+from agents.Commander.DQNCommander import DQNCommander
+from agents.Commander.RandomCommander import RandomCommander
+
+from agents.RL.DQN.network import DQNNetwork
+from agents.RL.DQN.encoder import ObservationEncoder
+from agents.RL.DQN.epsilon import EpsilonScheduler
+
+
+def wilson_score(
+    p: float,
+    n: int,
+    z: float = 1.96
+) -> tuple[float, float]:
+    """
+    Calculate 95% Wilson score interval.
+    """
+
+    if n == 0:
+        return 0.0, 0.0
+
+    denominator = 1 + z**2 / n
+
+    centre = (
+        p + z**2 / (2 * n)
+    )
+
+    deviation = math.sqrt(
+        (p * (1 - p) + z**2 / (4 * n)) / n
+    )
+
+    lower = (
+        centre - z * deviation
+    ) / denominator
+
+    upper = (
+        centre + z * deviation
+    ) / denominator
+
+    return max(0, lower), min(1, upper)
+
+
+
+def evaluate_seed(
+    seed_name,
+    seed_fn,
+    network,
+    n_episodes,
+    trace_mode=False
+):
+
+    print("\n" + "-" * 35)
+    print(f"Evaluating {seed_name}")
+    print("-" * 35)
+
+
+    wins = 0
+    win_types = Counter()
+
+    blue_wins = 0
+    blue_games = 0
+
+    red_wins = 0
+    red_games = 0
+
+
+    encoder = ObservationEncoder()
+
+    greedy_eps = EpsilonScheduler(
+        start=0.0,
+        end=0.0,
+        decay_steps=1
+    )
+
+
+    for episode in range(1, n_episodes + 1):
+
+        # Fresh commander each episode
+        dqn_agent = DQNCommander(
+            network=network,
+            encoder=encoder,
+            epsilon_scheduler=greedy_eps
+        )
+
+        random_agent = RandomCommander()
+
+
+        dqn_is_blue = episode % 2 == 1
+
+
+        blue = (
+            dqn_agent
+            if dqn_is_blue
+            else random_agent
+        )
+
+        red = (
+            random_agent
+            if dqn_is_blue
+            else dqn_agent
+        )
+
+
+        engine = TickEngine(
+            seed_fn(),
+            blue_commander=blue,
+            red_commander=red
+        )
+
+
+        if trace_mode:
+            print(
+                f"\nEpisode {episode} "
+                f"DQN={'BLUE' if dqn_is_blue else 'RED'}"
+            )
+
+
+        ticks = 0
+
+
+        while (
+            not engine.done
+            and ticks < 1000
+        ):
+
+            with torch.no_grad():
+                result = engine.step()
+
+            ticks += 1
+
+
+            if trace_mode:
+
+                obs = (
+                    result.blue_obs
+                    if dqn_is_blue
+                    else result.red_obs
+                )
+
+                print(
+                    f"Tick {ticks}"
+                )
+
+                print(
+                    "Units:",
+                    obs.own_unit_per_zone
+                )
+
+                print(
+                    "Actions:",
+                    dqn_agent.last_action_indices
+                )
+
+
+        final_state = engine.state
+
+
+        if final_state.battle_winner is None:
+
+            dqn_won = False
+            win_type = "timeout"
+
+        else:
+
+            dqn_won = (
+                final_state.battle_winner == Side.BLUE
+                and dqn_is_blue
+            ) or (
+                final_state.battle_winner == Side.RED
+                and not dqn_is_blue
+            )
+
+
+            zones = final_state.zones
+
+
+            zone_3 = next(
+                (
+                    z
+                    for z in zones
+                    if z.zone_id == 3
+                ),
+                None
+            )
+
+
+            total_red = sum(
+                z.red_units
+                for z in zones
+            )
+
+            total_blue = sum(
+                z.blue_units
+                for z in zones
+            )
+
+
+            if (
+                zone_3
+                and zone_3.side_control
+                in (
+                    ZoneControl.RED,
+                    ZoneControl.BLUE
+                )
+            ):
+
+                win_type = "zone3_hold"
+
+
+            elif (
+                total_red == 0
+                or total_blue == 0
+            ):
+
+                win_type = "elimination"
+
+
+            else:
+
+                win_type = "unknown"
+
+
+
+        if dqn_won:
+            wins += 1
+
+
+        win_types[win_type] += 1
+
+
+        if dqn_is_blue:
+
+            blue_games += 1
+
+            if dqn_won:
+                blue_wins += 1
+
+        else:
+
+            red_games += 1
+
+            if dqn_won:
+                red_wins += 1
+
+
+
+    rate = wins / n_episodes
+
+    low, high = wilson_score(
+        rate,
+        n_episodes
+    )
+
+
+    print(
+        f"DQN Win Rate: {rate:.1%}"
+        f" [{low:.1%}, {high:.1%}]"
+    )
+
+
+    print(
+        f"As Blue: {blue_wins}/{blue_games}"
+    )
+
+    print(
+        f"As Red: {red_wins}/{red_games}"
+    )
+
+
+    print("Win Types:")
+
+    for k, v in win_types.items():
+
+        print(
+            f"  {k}: {v}"
+            f" ({v/n_episodes:.1%})"
+        )
+
+
+    return {
+        "wins": wins,
+        "games": n_episodes,
+        "win_types": win_types
+    }
+
+
+
+
+def run_evaluation(
+    checkpoint_path,
+    n_episodes=100,
+    trace_mode=False
+):
+
+    print("=== ARES DQN Evaluation ===")
+    print(
+        f"Checkpoint: {checkpoint_path}"
+    )
+
+
+    state_dim = 12
+    hidden_dim = 128
+
+
+    network = DQNNetwork(
+        state_dim,
+        hidden_dim
+    )
+
+
+    try:
+
+        network.load_state_dict(
+            torch.load(
+                checkpoint_path,
+                map_location="cpu"
+            )
+        )
+
+    except FileNotFoundError:
+
+        print(
+            "Checkpoint missing. "
+            "Using random weights."
+        )
+
+
+    network.eval()
+
+
+
+    seed_pool = [
+        ("seed_1", get_seed_1),
+        ("seed_2", get_seed_2),
+        ("seed_3", get_seed_3),
+        ("seed_4", get_seed_4),
+    ]
+
+
+    total_wins = 0
+    total_games = 0
+
+    total_win_types = Counter()
+
+
+
+    for name, seed_fn in seed_pool:
+
+        result = evaluate_seed(
+            name,
+            seed_fn,
+            network,
+            n_episodes,
+            trace_mode
+        )
+
+
+        total_wins += result["wins"]
+
+        total_games += result["games"]
+
+        total_win_types.update(
+            result["win_types"]
+        )
+
+
+
+    rate = total_wins / total_games
+
+
+    low, high = wilson_score(
+        rate,
+        total_games
+    )
+
+
+    print("\n" + "=" * 35)
+
+    print("POOLED RESULTS")
+
+    print("=" * 35)
+
+
+    print(
+        f"Overall Win Rate: {rate:.1%}"
+        f" [{low:.1%}, {high:.1%}]"
+    )
+
+
+    print(
+        f"Games: {total_wins}/{total_games}"
+    )
+
+
+    print("Win Types:")
+
+
+    for k, v in total_win_types.items():
+
+        print(
+            f"  {k}: {v}"
+            f" ({v/total_games:.1%})"
+        )
+
+
+
+if __name__ == "__main__":
+
+    import argparse
+
+
+    parser = argparse.ArgumentParser(
+        description="ARES DQN Eval Harness"
+    )
+
+
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        default="checkpoint_dqn_ep_50.pt"
+    )
+
+
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=100
+    )
+
+
+    parser.add_argument(
+        "--trace",
+        action="store_true"
+    )
+
+
+    args = parser.parse_args()
+
+
+    run_evaluation(
+        checkpoint_path=args.ckpt,
+        n_episodes=(
+            1
+            if args.trace
+            else args.episodes
+        ),
+        trace_mode=args.trace
+    )
+
+
+================================================================================
+FILE: ./scripts/dqn_eval_vs_llm.py
+================================================================================
+
+"""
+Evaluation harness for DQN vs LLM on a new seed 5.
+
+Run from the repo root:
+    python scripts/dqn_eval_vs_llm.py
+
+This script evaluates checkpoints sequentially and stores a JSON result file
+under the repo's `results/` directory.
+"""
+
+import sys
+import pathlib
+import json
+import math
+import os
+import time
+from collections import Counter
+from datetime import datetime
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "ares-sim"))
+
+import torch
+
+from config.settings import Settings
+from config.seeds import get_seed_5
+from core.tick import TickEngine
+from core.state import Side, ZoneControl
+from agents.Commander.DQNCommander import DQNCommander
+from agents.Commander.LLMCommander import LLMCommander
+from agents.RL.DQN.network import DQNNetwork
+from agents.RL.DQN.encoder import ObservationEncoder
+from agents.RL.DQN.epsilon import EpsilonScheduler
+
+
+def wilson_score(p: float, n: int, z: float = 1.96) -> tuple[float, float]:
+    if n == 0:
+        return 0.0, 0.0
+
+    denominator = 1 + z**2 / n
+    centre = p + z**2 / (2 * n)
+    deviation = math.sqrt((p * (1 - p) + z**2 / (4 * n)) / n)
+    lower = (centre - z * deviation) / denominator
+    upper = (centre + z * deviation) / denominator
+    return max(0, lower), min(1, upper)
+
+
+def ensure_checkpoint_1(checkpoint_path: str) -> None:
+    if os.path.exists(checkpoint_path):
+        return
+
+    print(f"Checkpoint {checkpoint_path} not found. Creating an initial untrained checkpoint.")
+    network = DQNNetwork(state_dim=12, hidden_dim=128)
+    torch.save(network.state_dict(), checkpoint_path)
+
+
+def evaluate_checkpoint(checkpoint_path: str, n_episodes: int, model_name: str) -> dict:
+    print("\n" + "=" * 60)
+    print(f"Evaluating checkpoint: {checkpoint_path}")
+    print("=" * 60)
+
+    if checkpoint_path.endswith("checkpoint_dqn_ep_1.pt"):
+        ensure_checkpoint_1(checkpoint_path)
+
+    network = DQNNetwork(state_dim=12, hidden_dim=128)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    network.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+    network.eval()
+
+    encoder = ObservationEncoder()
+    greedy_eps = EpsilonScheduler(start=0.0, end=0.0, decay_steps=1)
+
+    wins = 0
+    win_types = Counter()
+    blue_wins = 0
+    blue_games = 0
+    red_wins = 0
+    red_games = 0
+
+    for episode in range(1, n_episodes + 1):
+        dqn_agent = DQNCommander(network=network, encoder=encoder, epsilon_scheduler=greedy_eps)
+        llm_agent = LLMCommander(model=model_name)
+
+        dqn_is_blue = episode % 2 == 1
+        blue = dqn_agent if dqn_is_blue else llm_agent
+        red = llm_agent if dqn_is_blue else dqn_agent
+
+        engine = TickEngine(get_seed_5(), blue_commander=blue, red_commander=red)
+
+        ticks = 0
+        while not engine.done and ticks < 10:
+            with torch.no_grad():
+                result = engine.step()
+            ticks += 1
+            time.sleep(10)
+
+        final_state = engine.state
+        if final_state.battle_winner is None:
+            dqn_won = False
+            win_type = "timeout"
+        else:
+            dqn_won = (
+                final_state.battle_winner == Side.BLUE and dqn_is_blue
+            ) or (
+                final_state.battle_winner == Side.RED and not dqn_is_blue
+            )
+
+            zones = final_state.zones
+            zone_3 = next((z for z in zones if z.zone_id == 3), None)
+            total_red = sum(z.red_units for z in zones)
+            total_blue = sum(z.blue_units for z in zones)
+
+            if zone_3 and zone_3.side_control in (ZoneControl.RED, ZoneControl.BLUE):
+                win_type = "zone3_hold"
+            elif total_red == 0 or total_blue == 0:
+                win_type = "elimination"
+            else:
+                win_type = "unknown"
+
+        if dqn_won:
+            wins += 1
+
+        win_types[win_type] += 1
+
+        if dqn_is_blue:
+            blue_games += 1
+            if dqn_won:
+                blue_wins += 1
+        else:
+            red_games += 1
+            if dqn_won:
+                red_wins += 1
+
+        print(
+            f"Episode {episode:2d} | "
+            f"Role: {'BLUE' if dqn_is_blue else 'RED'} | "
+            f"Winner: {final_state.battle_winner} | "
+            f"Ticks: {ticks} | "
+            f"DQN Win: {dqn_won}"
+        )
+
+    rate = wins / n_episodes
+    low, high = wilson_score(rate, n_episodes)
+
+    summary = {
+        "checkpoint": checkpoint_path,
+        "exists": os.path.exists(checkpoint_path),
+        "episodes": n_episodes,
+        "wins": wins,
+        "games": n_episodes,
+        "win_rate": rate,
+        "win_rate_ci": [low, high],
+        "blue_wins": blue_wins,
+        "blue_games": blue_games,
+        "red_wins": red_wins,
+        "red_games": red_games,
+        "win_types": dict(win_types),
+    }
+
+    print(f"DQN Win Rate: {rate:.1%} [{low:.1%}, {high:.1%}]")
+    print(f"As Blue: {blue_wins}/{blue_games}")
+    print(f"As Red: {red_wins}/{red_games}")
+
+    return summary
+
+
+def main():
+    settings = Settings()
+    model_name = settings.model_1
+
+    checkpoint_paths = [
+        "checkpoint_dqn_ep_1.pt",
+        "checkpoint_dqn_ep_100.pt",
+        "checkpoint_dqn_ep_200.pt",
+        "checkpoint_dqn_ep_500.pt",
+        "checkpoint_dqn_ep_1000.pt",
+        "checkpoint_dqn_ep_1500.pt",
+        "checkpoint_dqn_ep_2000.pt",
+    ]
+
+    results = {
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "seed": "seed_5",
+        "checkpoints": [],
+    }
+
+    results_dir = pathlib.Path(__file__).parent.parent / "results"
+    results_dir.mkdir(exist_ok=True)
+    output_path = results_dir / "dqn_vs_llm_seed5_results.json"
+
+    n_episodes = 1
+
+    for checkpoint_path in checkpoint_paths:
+        try:
+            summary = evaluate_checkpoint(checkpoint_path, n_episodes, model_name)
+        except Exception as exc:
+            summary = {
+                "checkpoint": checkpoint_path,
+                "error": str(exc),
+            }
+            print(f"Skipping {checkpoint_path}: {exc}")
+
+        results["checkpoints"].append(summary)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+
+    print(f"\nResults saved to {output_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+FILE: ./scripts/dqn_train.py
+================================================================================
+
+"""
+DQN self-play training script for ARES.
+
+This is the orchestration layer: it creates the environment, networks,
+replay buffer, trainer, and commanders, then runs episodes by calling
+engine.step() in a loop. The training script — not the commander and
+not the simulator — owns the learning process.
+"""
+
+import sys
+import pathlib
+import argparse
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "ares-sim"))
+
+import torch
+import torch.optim as optim
+
+from config.seeds import get_seed_1, get_seed_2, get_seed_3, get_seed_4
+from core.tick import TickEngine
+from agents.Commander.DQNCommander import DQNCommander
+from agents.RL.DQN.network import DQNNetwork
+from agents.RL.DQN.encoder import ObservationEncoder
+from agents.RL.DQN.epsilon import EpsilonScheduler
+from agents.RL.DQN.replay_buffer import ReplayBuffer
+from agents.RL.DQN.trainer import Trainer
+import random
+NUM_ZONES = 5
+
+
+def _build_action_tensor(action_indices: dict[int, int]) -> torch.Tensor:
+    """Convert zone → action_idx dict to a fixed-size tensor of shape (NUM_ZONES,).
+
+    Each position corresponds to one zone (index 0 → zone 1, etc.).
+    Zones with no units (absent from the dict) default to action 0 (hold).
+    """
+    t = torch.zeros(NUM_ZONES, dtype=torch.long)
+    for zone_id, action_idx in action_indices.items():
+        t[zone_id - 1] = action_idx
+    return t
+
+
+def run_training(resume_from: str | None = None):
+    # ── 1. Hyperparameters ──────────────────────────────────────────────
+    state_dim = 12            # Must match ObservationEncoder feature count
+    hidden_dim = 128
+    batch_size = 32
+    gamma = 0.99
+    lr = 1e-3
+    episodes = 2000
+    max_ticks_per_episode = 1000
+    replay_capacity = 50_000
+    sync_every_k_steps = 100
+    max_grad_norm = 10.0
+    epsilon_start = 1.0
+    epsilon_end = 0.05
+    epsilon_decay_steps = 10_000
+
+    # ── 2. Create networks ──────────────────────────────────────────────
+    online_net = DQNNetwork(state_dim, hidden_dim)
+    target_net = DQNNetwork(state_dim, hidden_dim)
+    target_net.load_state_dict(online_net.state_dict())
+
+    start_episode = 1
+    if resume_from is not None:
+        state_dict = torch.load(resume_from, map_location=torch.device("cpu"))
+        online_net.load_state_dict(state_dict)
+        target_net.load_state_dict(state_dict)
+        # Infer start episode from filename like checkpoint_dqn_ep_500.pt
+        stem = pathlib.Path(resume_from).stem
+        if stem.startswith("checkpoint_dqn_ep_"):
+            start_episode = int(stem.rsplit("_", 1)[-1]) + 1
+        print(f"Resumed weights from {resume_from}, starting at episode {start_episode}")
+
+    # ── 3. Create shared infrastructure ─────────────────────────────────
+    encoder = ObservationEncoder()
+    replay_buffer = ReplayBuffer(capacity=replay_capacity)
+    optimizer = optim.Adam(online_net.parameters(), lr=lr)
+
+    trainer = Trainer(
+        online_net=online_net,
+        target_net=target_net,
+        optimizer=optimizer,
+        replay_buffer=replay_buffer,
+        batch_size=batch_size,
+        gamma=gamma,
+        sync_every_k_steps=sync_every_k_steps,
+        max_grad_norm=max_grad_norm,
+    )
+
+    # ── 4. Create commanders (both share the SAME online network) ───────
+    blue_eps = EpsilonScheduler(start=epsilon_start, end=epsilon_end, decay_steps=epsilon_decay_steps)
+    red_eps = EpsilonScheduler(start=epsilon_start, end=epsilon_end, decay_steps=epsilon_decay_steps)
+
+    blue_agent = DQNCommander(network=online_net, encoder=encoder, epsilon_scheduler=blue_eps)
+    red_agent = DQNCommander(network=online_net, encoder=encoder, epsilon_scheduler=red_eps)
+
+    if resume_from is not None:
+        # Epsilon already at floor after prior training; keep exploration minimal.
+        blue_agent.tick_counter = epsilon_decay_steps
+        red_agent.tick_counter = epsilon_decay_steps
+    
+    seeds = [get_seed_1(), get_seed_2(), get_seed_3(), get_seed_4()]
+    for episode in range(start_episode, episodes + 1):
+        seed_fn = random.choice(seeds)
+        initial_state = seed_fn
+        engine = TickEngine(initial_state, blue_commander=blue_agent, red_commander=red_agent)
+
+        ticks_this_episode = 0
+        episode_reward_blue = 0.0
+        last_loss = None
+        last_zone_losses = None
+        last_zone_q_stats = None
+
+        while not engine.done and ticks_this_episode < max_ticks_per_episode:
+            result = engine.step()
+            ticks_this_episode += 1
+
+            # ── Encode observations and build action tensors ────────────
+            blue_state_t = encoder.encode(result.blue_obs)
+            blue_action_t = _build_action_tensor(blue_agent.last_action_indices)
+
+            red_state_t = encoder.encode(result.red_obs)
+            red_action_t = _build_action_tensor(red_agent.last_action_indices)
+
+            if result.done:
+                # Terminal state: next obs is a zero tensor
+                blue_next_t = torch.zeros_like(blue_state_t)
+                red_next_t = torch.zeros_like(red_state_t)
+            else:
+                blue_next_t = encoder.encode(result.next_blue_obs)
+                red_next_t = encoder.encode(result.next_red_obs)
+
+            # ── Push both sides' transitions into shared replay ─────────
+            replay_buffer.push(blue_state_t, blue_action_t, result.blue_reward, blue_next_t, result.done)
+            replay_buffer.push(red_state_t, red_action_t, result.red_reward, red_next_t, result.done)
+
+            episode_reward_blue += result.blue_reward
+
+            # ── Train after each step ───────────────────────────────────
+            train_result = trainer.train_step()
+            if train_result is not None:
+                last_loss, last_zone_losses, last_zone_q_stats = train_result
+
+        # ── Episode reporting ───────────────────────────────────────────
+        if episode % 10 == 0:
+            current_eps = blue_eps.get_epsilon(blue_agent.tick_counter)
+            zone_loss_str = "N/A"
+            if last_zone_losses is not None:
+                zone_loss_str = ", ".join(f"Z{z}:{l:.2f}" for z, l in sorted(last_zone_losses.items()))
+
+            q_mean_str = "N/A"
+            q_max_str = "N/A"
+            if last_zone_q_stats is not None:
+                q_mean_str = ", ".join(
+                    f"Z{z}:{s['mean']:.1f}" for z, s in sorted(last_zone_q_stats.items())
+                )
+                q_max_str = ", ".join(
+                    f"Z{z}:{s['max']:.1f}" for z, s in sorted(last_zone_q_stats.items())
+                )
+
+            print(
+                f"Episode {episode:4d} | "
+                f"Ticks: {ticks_this_episode:4d} | "
+                f"Blue Reward: {episode_reward_blue:+8.2f} | "
+                f"Loss: {last_loss if last_loss is not None else 'N/A':>6.2f} "
+                f"({zone_loss_str}) | "
+                f"Q-mean: [{q_mean_str}] | "
+                f"Q-max: [{q_max_str}] | "
+                f"Epsilon: {current_eps:.3f} | "
+                f"Buffer: {len(replay_buffer)}"
+            )
+
+        # ── Periodic checkpoint ─────────────────────────────────────────
+        if episode in {1500, 2000}:
+            ckpt_path = f"checkpoint_dqn_ep_{episode}.pt"
+            blue_agent.save(ckpt_path)
+            print(f"  -> Saved checkpoint: {ckpt_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ARES DQN self-play training")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="checkpoint_dqn_ep_500.pt",
+        help="Checkpoint to resume from (default: checkpoint_dqn_ep_500.pt). Pass '' to train from scratch.",
+    )
+    args = parser.parse_args()
+    resume_from = args.resume or None
+    run_training(resume_from=resume_from)
+
+
+================================================================================
+FILE: ./scripts/multi_tick.py
+================================================================================
+
+import sys
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "ares-sim"))
+
+from config.settings import settings
+from config.seeds import get_seed_1
+from agents.Commander.LLMCommander import LLMCommander
+from core.tick import TickEngine
+
+
+state = get_seed_1()
+
+
+blue_commander = LLMCommander(model=settings.model_1)
+red_commander  = LLMCommander(model=settings.model_1)
+logpath = pathlib.Path(__file__).parent.parent / "logs" /"multi_tick_run_jsonl"   
+
+engine = TickEngine(state,blue_commander,red_commander,logpath)
+max_ticks = 15 
+final_state = engine.run(max_ticks)
+
+print(f"Final tick: {final_state.current_tick}")
+print(f"Battle winner: {final_state.battle_winner}")
+print(f"Log written to: {logpath}")
+
+
+
+
+
+
+================================================================================
+FILE: ./scripts/smoke_dqn.py
+================================================================================
+
+"""Smoke test for DQN training: run 2 episodes and verify everything connects."""
+import sys
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "ares-sim"))
+
+import torch
+import torch.optim as optim
+
+from config.seeds import get_seed_1
+from core.tick import TickEngine
+from agents.Commander.DQNCommander import DQNCommander
+from agents.RL.DQN.network import DQNNetwork
+from agents.RL.DQN.encoder import ObservationEncoder
+from agents.RL.DQN.epsilon import EpsilonScheduler
+from agents.RL.DQN.replay_buffer import ReplayBuffer
+from agents.RL.DQN.trainer import Trainer
+
+NUM_ZONES = 5
+
+def _build_action_tensor(action_indices):
+    t = torch.zeros(NUM_ZONES, dtype=torch.long)
+    for zone_id, action_idx in action_indices.items():
+        t[zone_id - 1] = action_idx
+    return t
+
+print("=== DQN Training Smoke Test ===")
+print()
+
+# Create components
+state_dim = 12
+hidden_dim = 128
+online_net = DQNNetwork(state_dim, hidden_dim)
+target_net = DQNNetwork(state_dim, hidden_dim)
+target_net.load_state_dict(online_net.state_dict())
+
+encoder = ObservationEncoder()
+replay_buffer = ReplayBuffer(capacity=10_000)
+optimizer = optim.Adam(online_net.parameters(), lr=1e-3)
+
+trainer = Trainer(
+    online_net=online_net, target_net=target_net,
+    optimizer=optimizer, replay_buffer=replay_buffer,
+    batch_size=8, gamma=0.99, sync_every_k_steps=100,
+)
+
+blue_eps = EpsilonScheduler(start=1.0, end=0.05, decay_steps=1000)
+red_eps = EpsilonScheduler(start=1.0, end=0.05, decay_steps=1000)
+blue_agent = DQNCommander(network=online_net, encoder=encoder, epsilon_scheduler=blue_eps)
+red_agent = DQNCommander(network=online_net, encoder=encoder, epsilon_scheduler=red_eps)
+
+print("[OK] All components created successfully")
+
+# Run 2 short episodes
+for ep in range(1, 3):
+    state = get_seed_1()
+    engine = TickEngine(state, blue_commander=blue_agent, red_commander=red_agent)
+
+    ticks = 0
+    while not engine.done and ticks < 20:
+        result = engine.step()
+        ticks += 1
+
+        blue_state_t = encoder.encode(result.blue_obs)
+        blue_action_t = _build_action_tensor(blue_agent.last_action_indices)
+        red_state_t = encoder.encode(result.red_obs)
+        red_action_t = _build_action_tensor(red_agent.last_action_indices)
+
+        if result.done:
+            blue_next_t = torch.zeros_like(blue_state_t)
+            red_next_t = torch.zeros_like(red_state_t)
+        else:
+            blue_next_t = encoder.encode(result.next_blue_obs)
+            red_next_t = encoder.encode(result.next_red_obs)
+
+        replay_buffer.push(blue_state_t, blue_action_t, result.blue_reward, blue_next_t, result.done)
+        replay_buffer.push(red_state_t, red_action_t, result.red_reward, red_next_t, result.done)
+
+        train_result = trainer.train_step()
+        if train_result is not None:
+            loss, _, _ = train_result
+
+    print(f"  Episode {ep}: {ticks} ticks, buffer={len(replay_buffer)}, "
+          f"done={result.done}, blue_reward_last={result.blue_reward}")
+
+print()
+
+# Verify trainer ran
+print(f"Trainer steps completed: {trainer.step_count}")
+print(f"Replay buffer size: {len(replay_buffer)}")
+
+# Verify a training step returns a loss
+train_result = trainer.train_step()
+if train_result is not None:
+    loss, zone_losses, zone_q_stats = train_result
+else:
+    loss = None
+print(f"Training loss: {loss}")
+assert loss is not None, "Expected a loss value!"
+print()
+print("[OK] DQN training pipeline works end-to-end")
+
+
+================================================================================
+FILE: ./scripts/smoke_llm.py
+================================================================================
+
+"""
+Smoke test: single LLMCommander.decide() call.
+
+Run from the repo root:
+    python scripts/smoke_llm.py
+
+Reads GROQ_API_KEY and MODEL_1 from .env via pydantic_settings.
+"""
+
+import sys
+import pathlib
+
+# Add ares-sim to path so bare package imports (core, agents, config) resolve
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "ares-sim"))
+
+from config.settings import Settings
+from config.seeds import get_seed_1
+from core.obs import build_obs
+from core.state import Side
+from agents.models import CommanderMemory
+from agents.Commander.LLMCommander import LLMCommander
+
+state = get_seed_1()
+
+# Same empty enemy memory TickEngine starts with on tick 0
+enemy_memory = {"zone": None, "units": None, "tick_seen": None}
+
+obs = build_obs(state, Side.BLUE, enemy_memory)
+
+memory = CommanderMemory(
+    current_objective="No prior objective",
+    last_action_summary="N/A",
+    tick_of_last_strategy_changed=None,
+)
+
+settings = Settings()  # loads .env automatically
+commander = LLMCommander(model=settings.model_1)
+
+print(f"Model : {settings.model_1}")
+print(f"Obs   : {obs.model_dump()}")
+print()
+
+result = commander.decide(obs, memory)
+
+print("=== RESULT ===")
+print(f"call_outcome : {commander.last_call_outcome}")
+print(f"actions      : {result.actions.model_dump()}")
+print(f"memory       : {result.memory.model_dump()}")
+
+
+================================================================================
+FILE: ./scripts/smoke_refactor.py
+================================================================================
+
+"""Quick smoke test: verify step()/run() backward compat with DummyCommander."""
+import sys
+import pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "ares-sim"))
+
+from config.seeds import get_seed_1
+from core.tick import TickEngine
+from agents.models import Actions, CommanderDecision, CommanderMemory
+
+
+class DummyCommander:
+    def __init__(self):
+        self.last_call_outcome = "success"
+
+    def decide(self, obs, memory=None):
+        if memory is None:
+            memory = CommanderMemory(current_objective="", last_action_summary="", tick_of_last_strategy_changed=None)
+        return CommanderDecision(actions=Actions(actions=[]), memory=memory)
+
+
+# Test 1: run() still works (backward compat)
+print("=" * 60)
+print("Test 1: run() backward compatibility")
+state = get_seed_1()
+engine = TickEngine(state, DummyCommander(), DummyCommander())
+final = engine.run(max_ticks=10)
+print(f"  Final tick: {final.current_tick}")
+print(f"  Active: {final.is_engagement_active}")
+print(f"  Winner: {final.battle_winner}")
+print("  [OK] PASSED")
+
+# Test 2: step() returns StepResult
+print()
+print("Test 2: step() returns StepResult")
+state = get_seed_1()
+engine = TickEngine(state, DummyCommander(), DummyCommander())
+result = engine.step()
+print(f"  Type: {type(result).__name__}")
+print(f"  blue_obs side: {result.blue_obs.side}")
+print(f"  red_obs side: {result.red_obs.side}")
+print(f"  blue_reward: {result.blue_reward}")
+print(f"  red_reward: {result.red_reward}")
+print(f"  done: {result.done}")
+print(f"  next_blue_obs: {'present' if result.next_blue_obs else 'None'}")
+print(f"  info keys: {list(result.info.keys())}")
+print("  [OK] PASSED")
+
+# Test 3: step() loop matches run()
+print()
+print("Test 3: step() loop equivalence")
+state = get_seed_1()
+engine = TickEngine(state, DummyCommander(), DummyCommander())
+ticks = 0
+while not engine.done and ticks < 10:
+    engine.step()
+    ticks += 1
+print(f"  Ticks executed: {ticks}")
+print(f"  Final tick: {engine.state.current_tick}")
+assert engine.state.current_tick == final.current_tick, "MISMATCH!"
+print(f"  Matches run() result: OK")
+print("  [OK] PASSED")
+
+# Test 4: done property
+print()
+print("Test 4: engine.done property")
+state = get_seed_1()
+engine = TickEngine(state, DummyCommander(), DummyCommander())
+print(f"  Before any steps: done={engine.done}")
+assert not engine.done
+engine.run(max_ticks=10)
+print(f"  After run(10):    done={engine.done}")
+print("  [OK] PASSED")
+
+print()
+print("=" * 60)
+print("ALL TESTS PASSED")
+
+
+================================================================================
+FILE: ./scripts/__init__.py
+================================================================================
+
+
+
+================================================================================
+FILE: ./tests/test_200_tick_run.py
+================================================================================
+
+#!/usr/bin/env python3
+"""
+Sanity test: Run 200 ticks and verify win condition termination logic.
+Track which win path fires: zone-3 hold, elimination, or timeout.
+"""
+
+import sys
+sys.path.insert(0, 'ares-sim')
+
+from core.tick import TickEngine
+from config.seeds import get_seed_1
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(name)s] %(message)s'
+)
+logger = logging.getLogger('TEST')
+
+# Dummy commander that always holds
+class DummyCommander:
+    def __init__(self, side):
+        self.side = side
+        self.last_call_outcome = "success"
+    
+    def decide(self, obs, memory=None):
+        from agents.models import Actions, CommanderAction, ActionType, CommanderDecision, CommanderMemory
+        if memory is None:
+            memory = CommanderMemory(current_objective="", last_action_summary="", tick_of_last_strategy_changed=None)
+        # Always hold (no-op actions)
+        return CommanderDecision(actions=Actions(actions=[]), memory=memory)
+
+def run_test():
+    """Run 200 ticks and report results."""
+    state = get_seed_1()
+    engine = TickEngine(state, DummyCommander('BLUE'), DummyCommander('RED'))
+    
+    logger.info("=" * 70)
+    logger.info(f"Starting 200-tick simulation with ZONE_3_WIN_THRESHOLD=6")
+    logger.info("=" * 70)
+    logger.info(f"Initial state: zone_3_consecutive_ticks=0, is_engagement_active=True")
+    logger.info("")
+    
+    final_state = engine.run(max_ticks=200)
+    
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("FINAL RESULTS")
+    logger.info("=" * 70)
+    logger.info(f"Ticks executed: {final_state.current_tick}")
+    logger.info(f"is_engagement_active: {final_state.is_engagement_active}")
+    logger.info(f"battle_winner: {final_state.battle_winner}")
+    logger.info(f"zone_3_consecutive_ticks: {final_state.zone_3_consecutive_ticks}")
+    
+    # Determine win condition type
+    if final_state.battle_winner is not None:
+        if final_state.current_tick < 200:
+            # Early termination
+            zone_3 = next(z for z in final_state.zones if z.zone_id == 3)
+            
+            total_red = sum(z.red_units for z in final_state.zones)
+            total_blue = sum(z.blue_units for z in final_state.zones)
+            
+            if total_red == 0 or total_blue == 0:
+                logger.info(f"✓ WIN CONDITION: ELIMINATION (Red={total_red}, Blue={total_blue})")
+            elif zone_3.side_control in ('red', 'blue'):
+                logger.info(f"✓ WIN CONDITION: ZONE-3 HOLD (control={zone_3.side_control}, consecutive_ticks={final_state.zone_3_consecutive_ticks})")
+            else:
+                logger.info(f"⚠ WIN CONDITION: Unknown (but battle ended)")
+        else:
+            logger.info(f"⚠ TIMEOUT: Reached max_ticks=200 but battle_winner is {final_state.battle_winner}")
+    else:
+        if final_state.current_tick >= 200:
+            logger.info(f"⚠ TIMEOUT: Ran full 200 ticks with no winner")
+            total_red = sum(z.red_units for z in final_state.zones)
+            total_blue = sum(z.blue_units for z in final_state.zones)
+            logger.info(f"   Final units: Red={total_red}, Blue={total_blue}")
+            zone_3 = next(z for z in final_state.zones if z.zone_id == 3)
+            logger.info(f"   Zone 3 control: {zone_3.side_control} (consecutive_ticks={final_state.zone_3_consecutive_ticks})")
+        else:
+            logger.info(f"⚠ ERROR: Terminated early but no winner set")
+    
+    logger.info("")
+    logger.info("Final zone state:")
+    for z in final_state.zones:
+        logger.info(f"  Zone {z.zone_id}: red={z.red_units:3d}, blue={z.blue_units:3d}, control={z.side_control:10s}")
+
+if __name__ == '__main__':
+    run_test()
+
+
+================================================================================
+FILE: ./tests/test_win_check.py
+================================================================================
+
+#!/usr/bin/env python3
+import sys
+sys.path.insert(0, 'ares-sim')
+
+from core.tick import TickEngine
+from config.seeds import get_seed_1
+from agents.models import Actions
+import logging
+
+logging.basicConfig(level=logging.INFO, format='[%(name)s] %(message)s')
+logger = logging.getLogger('TEST')
+
+class DummyCommander:
+    def __init__(self):
+        self.last_call_outcome = "success"
+
+    def decide(self, obs, memory=None):
+        from agents.models import CommanderDecision, CommanderMemory
+        if memory is None:
+            memory = CommanderMemory(current_objective="", last_action_summary="", tick_of_last_strategy_changed=None)
+        return CommanderDecision(actions=Actions(actions=[]), memory=memory)
+
+state = get_seed_1()
+engine = TickEngine(state, DummyCommander(), DummyCommander())
+
+logger.info("=" * 70)
+logger.info("Starting 200-tick simulation with ZONE_3_WIN_THRESHOLD=6")
+logger.info("=" * 70)
+
+final_state = engine.run(max_ticks=200)
+
+logger.info("")
+logger.info("=" * 70)
+logger.info("FINAL RESULTS")
+logger.info("=" * 70)
+logger.info(f"Ticks executed: {final_state.current_tick}")
+logger.info(f"is_engagement_active: {final_state.is_engagement_active}")
+logger.info(f"battle_winner: {final_state.battle_winner}")
+logger.info(f"zone_3_consecutive_ticks: {final_state.zone_3_consecutive_ticks}")
+
+zone_3 = next(z for z in final_state.zones if z.zone_id == 3)
+total_red = sum(z.red_units for z in final_state.zones)
+total_blue = sum(z.blue_units for z in final_state.zones)
+
+logger.info(f"Zone 3 control: {zone_3.side_control}")
+logger.info(f"Total units - Red: {total_red}, Blue: {total_blue}")
+
+if final_state.battle_winner:
+    if total_red == 0 or total_blue == 0:
+        logger.info("✓ WIN: ELIMINATION")
+    elif final_state.zone_3_consecutive_ticks >= 6:
+        logger.info("✓ WIN: ZONE-3 HOLD")
+else:
+    logger.info(f"⚠ NO WINNER (ticks={final_state.current_tick})")
+
+
+================================================================================
+FILE: ./tests/test_zones.py
+================================================================================
+
+import pytest
+import sys
+sys.path.insert(0, 'ares-sim')
+
+from core.zones import determine_zone_control
+from core.state import ZoneControl
+
+class TestDetermineZoneControl:
+    """Unit tests for zone control determination logic."""
+
+    def test_both_sides_zero_units(self):
+        """Empty zone is neutral."""
+        result = determine_zone_control(red_units=0, blue_units=0)
+        assert result == ZoneControl.NEUTRAL
+
+    def test_red_only_present(self):
+        """Zone with only red units is red-controlled."""
+        result = determine_zone_control(red_units=10, blue_units=0)
+        assert result == ZoneControl.RED
+
+    def test_blue_only_present(self):
+        """Zone with only blue units is blue-controlled."""
+        result = determine_zone_control(red_units=0, blue_units=10)
+        assert result == ZoneControl.BLUE
+
+    def test_red_dominant(self):
+        """Red outnumbers blue decisively."""
+        result = determine_zone_control(red_units=100, blue_units=10)
+        assert result == ZoneControl.RED
+
+    def test_blue_dominant(self):
+        """Blue outnumbers red decisively."""
+        result = determine_zone_control(red_units=10, blue_units=100)
+        assert result == ZoneControl.BLUE
+
+    def test_forces_contested_equal(self):
+        """Equal forces create contested zone."""
+        result = determine_zone_control(red_units=50, blue_units=50)
+        assert result == ZoneControl.CONTESTED
+
+    def test_forces_contested_close(self):
+        """Close forces (within contest ratio) create contested zone."""
+        # Assuming ZONE_CONTEST_RATIO allows this
+        result = determine_zone_control(red_units=70, blue_units=80)
+        # Could be contested or decided depending on config
+        assert result in [ZoneControl.CONTESTED, ZoneControl.BLUE, ZoneControl.RED]
+
+    def test_argument_order_matters(self):
+        """Verify that swapping red/blue gives opposite results."""
+        result_red_dominant = determine_zone_control(red_units=100, blue_units=10)
+        result_blue_dominant = determine_zone_control(red_units=10, blue_units=100)
+        
+        # These should be different
+        assert result_red_dominant != result_blue_dominant
+        # And specifically opposite
+        assert result_red_dominant == ZoneControl.RED
+        assert result_blue_dominant == ZoneControl.BLUE
+
+
+================================================================================
+FILE: ./tests/__init__.py
+================================================================================
+
+
